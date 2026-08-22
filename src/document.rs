@@ -216,6 +216,13 @@ impl Document {
     }
 
     pub fn save(&mut self, path: &Path) -> Result<(), String> {
+        self.write_copy(path)?;
+        self.path = Some(path.to_owned());
+        self.dirty = false;
+        Ok(())
+    }
+
+    pub fn write_copy(&self, path: &Path) -> Result<(), String> {
         let bytes = litematic::to_litematic(&self.schematic)
             .map_err(|error| format!("Litematicを生成できません: {error}"))?;
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -228,9 +235,20 @@ impl Document {
             .map_err(|error| format!("一時ファイルを書き込めません: {error}"))?;
         fs::rename(&temp, path)
             .map_err(|error| format!("保存ファイルを置き換えられません: {error}"))?;
-        self.path = Some(path.to_owned());
-        self.dirty = false;
         Ok(())
+    }
+
+    pub fn selected_blocks(&self, a: BlockPos, b: BlockPos) -> Vec<(BlockPos, String)> {
+        let min = BlockPos::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z));
+        let max = BlockPos::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z));
+        self.blocks()
+            .into_iter()
+            .filter(|(pos, _)| {
+                (min.x..=max.x).contains(&pos.x)
+                    && (min.y..=max.y).contains(&pos.y)
+                    && (min.z..=max.z).contains(&pos.z)
+            })
+            .collect()
     }
 
     pub(crate) fn schematic(&self) -> &UniversalSchematic {
@@ -262,6 +280,31 @@ impl Document {
     }
 }
 
+pub fn rotate_state_y(state: &str) -> Result<String, String> {
+    let mut block = nucleation::BlockState::from_block_string(state)?;
+    if let Some(value) = block.get_property("facing").cloned() {
+        let rotated = match value.as_str() {
+            "north" => "east",
+            "east" => "south",
+            "south" => "west",
+            "west" => "north",
+            _ => value.as_str(),
+        };
+        block.set_property("facing", rotated);
+    }
+    let cardinal = ["north", "east", "south", "west"];
+    let values: Vec<_> = cardinal
+        .iter()
+        .map(|key| block.get_property(key).cloned())
+        .collect();
+    for (index, value) in values.into_iter().enumerate() {
+        if let Some(value) = value {
+            block.set_property(cardinal[(index + 1) % 4], value);
+        }
+    }
+    Ok(block.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +318,46 @@ mod tests {
         assert!(document.blocks().is_empty());
         assert!(document.redo().unwrap());
         assert_eq!(document.blocks().len(), 20);
+    }
+
+    #[test]
+    fn litematic_round_trip_keeps_block_state() {
+        let mut document = Document::default();
+        document
+            .apply_cells([(
+                BlockPos::new(3, 2, -4),
+                "minecraft:repeater[delay=3,facing=east,locked=false,powered=false]",
+            )])
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "redforge-roundtrip-{}-{}.litematic",
+            std::process::id(),
+            document.revision
+        ));
+        document.save(&path).unwrap();
+        document
+            .apply_cells([(BlockPos::new(0, 0, 0), "minecraft:stone")])
+            .unwrap();
+        document.save(&path).unwrap();
+        let loaded = Document::open(&path).unwrap();
+        assert_eq!(
+            loaded.block(BlockPos::new(3, 2, -4)),
+            document.block(BlockPos::new(3, 2, -4))
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rotates_facing_and_wire_sides() {
+        assert_eq!(
+            rotate_state_y("minecraft:observer[facing=north,powered=false]").unwrap(),
+            "minecraft:observer[facing=east,powered=false]"
+        );
+        let wire = rotate_state_y(
+            "minecraft:redstone_wire[east=side,north=up,power=0,south=none,west=side]",
+        )
+        .unwrap();
+        assert!(wire.contains("east=up"));
+        assert!(wire.contains("south=side"));
     }
 }
