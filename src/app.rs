@@ -229,6 +229,9 @@ struct RenderedRevision(Option<(u64, u64, Option<u32>, Option<BlockPos>)>);
 struct CursorCell(Option<BlockPos>);
 
 #[derive(Resource, Default)]
+struct ViewportBounds(Option<egui::Rect>);
+
+#[derive(Resource, Default)]
 struct PaintDrag {
     button: Option<MouseButton>,
     cells: BTreeSet<BlockPos>,
@@ -287,6 +290,7 @@ pub fn run() {
         })
         .init_resource::<RenderedRevision>()
         .init_resource::<CursorCell>()
+        .init_resource::<ViewportBounds>()
         .init_resource::<PaintDrag>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
@@ -402,11 +406,15 @@ fn sync_scene(
         );
     }
     for pos in positions {
-        let state = editor
-            .simulation
-            .as_ref()
-            .map(|simulation| simulation.block(pos))
-            .unwrap_or_else(|| editor.document.block(pos));
+        let state = if editor.brewing.contains_key(&pos) {
+            editor.document.block(pos)
+        } else {
+            editor
+                .simulation
+                .as_ref()
+                .map(|simulation| simulation.block(pos))
+                .unwrap_or_else(|| editor.document.block(pos))
+        };
         if state == AIR {
             continue;
         }
@@ -484,11 +492,17 @@ fn update_cursor(
     camera: Single<(&Camera, &GlobalTransform), With<MainCamera>>,
     window: Single<&Window>,
     editor: Res<Editor>,
+    viewport_bounds: Res<ViewportBounds>,
     mut cursor: ResMut<CursorCell>,
     cursor_preview: Single<(&mut Transform, &mut Visibility), With<CursorPreview>>,
     selection_preview: SelectionPreviewQuery,
 ) {
-    cursor.0 = if editor.camera == CameraPreset::Orbit {
+    let in_viewport = window.cursor_position().is_some_and(|screen| {
+        viewport_bounds
+            .0
+            .is_some_and(|bounds| bounds.contains(egui::pos2(screen.x, screen.y)))
+    });
+    cursor.0 = if editor.camera == CameraPreset::Orbit || !in_viewport {
         None
     } else {
         window
@@ -972,6 +986,7 @@ fn recovery_path() -> PathBuf {
 fn editor_ui(
     mut contexts: EguiContexts,
     mut editor: ResMut<Editor>,
+    mut viewport_bounds: ResMut<ViewportBounds>,
     mut exit: MessageWriter<AppExit>,
     mut fonts_configured: Local<bool>,
 ) -> Result {
@@ -1080,11 +1095,15 @@ fn editor_ui(
             ui.heading("Inspector");
             if let Some(pos) = editor.selected {
                 ui.monospace(format!("x={} y={} z={}", pos.x, pos.y, pos.z));
-                let state = editor
-                    .simulation
-                    .as_ref()
-                    .map(|simulation| simulation.block(pos))
-                    .unwrap_or_else(|| editor.document.block(pos));
+                let state = if editor.brewing.contains_key(&pos) {
+                    editor.document.block(pos)
+                } else {
+                    editor
+                        .simulation
+                        .as_ref()
+                        .map(|simulation| simulation.block(pos))
+                        .unwrap_or_else(|| editor.document.block(pos))
+                };
                 ui.monospace(state);
                 if editor.document.inventory_slot_count(pos).is_some() {
                     ui.collapsing("Inventory", |ui| {
@@ -1170,6 +1189,13 @@ fn editor_ui(
                         stand.comparator_output(),
                         stand.bottle_flags()
                     ));
+                    let contents: Vec<_> = stand
+                        .items()
+                        .iter()
+                        .filter(|item| item.slot < 3)
+                        .map(|item| item.potion().unwrap_or(&item.id))
+                        .collect();
+                    ui.small(format!("内容: {}", contents.join(", ")));
                     if stand.observer_pulse {
                         ui.colored_label(egui::Color32::YELLOW, "Observer pulse");
                     }
@@ -1286,6 +1312,7 @@ fn editor_ui(
     egui::Panel::bottom("status").show(&mut root, |ui| {
         ui.label(&editor.message);
     });
+    viewport_bounds.0 = Some(root.available_rect_before_wrap());
 
     if editor.confirm_discard {
         egui::Window::new("未保存の変更")

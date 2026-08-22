@@ -1,8 +1,8 @@
 # RedForge 要件定義・基本設計
 
-> 文書版: 0.2-review  
+> 文書版: 1.0-technical-preview
 > 更新日: 2026-08-23  
-> 状態: 実装前の判断基準
+> 状態: Gate 0〜3および限定醸造を実装済み
 
 ## 0. 本書の位置づけ
 
@@ -154,6 +154,8 @@ Gate 0が成立しない場合、独自tick engineは作らず、Nucleationの�
 
 Gate 0〜2を本書でのMVPとする。
 
+実装結果: Gate 0〜2は完了した。代表fixture、`.litematic` round-trip、編集transaction、GUI操作を自動・手動確認している。ユーザーテストによる完了条件3.3-5のみ未実施である。
+
 ### 3.4 Gate 3: Mechanism Beta
 
 MVPの利用結果を見て、次の一つの実利用シナリオを選んで追加する。一括実装しない。
@@ -167,12 +169,26 @@ MVPの利用結果を見て、次の一つの実利用シナリオを選んで�
 - `.schem` v2/v3 import/export
 - probeとupdate traceの強化
 
-### 3.5 長期候補
+実装結果: 利用シナリオを「containerからの信号・dispenserによるwater配置」とし、hopper / barrel / dispenser / dropperの限定inventory、hopper → comparator、dispenser → water、pressure plateを実装した。water flowは制限あり、farmland / wheatは静的表示・保存として扱う。
+
+### 3.5 限定醸造拡張
+
+ユーザー指定に基づき、長期候補だった醸造台をTechnical Previewへ前倒しした。Nucleationのtick engineはinventoryを持つ醸造台block entityを受理できないため、二つ目の汎用backendは作らず、次の限定ロジックだけをRedForge内の純粋な状態機械として実装する。
+
+- 5 slot inventory（瓶0〜2、材料3、燃料4）と上下・側面のslot規則
+- ブレイズパウダー1個 = 20回分、1醸造 = 400 tick
+- 水 → 奇妙、奇妙 → 俊敏、俊敏 → 効果時間延長の3レシピ
+- 瓶占有BlockState、比較器の5 slot fullness計算、瓶占有変化のObserver pulse判定
+- potion componentを含むitem NBTの`.litematic` round-trip
+
+醸造開始時は、醸造台block entityだけを除いた安全なsnapshotをNucleationへ渡す。RedForge側の比較器出力は正確に計算・表示するが、醸造中のinventory変化をNucleation下流回路へ動的伝播する機能は未対応とし、InspectorとDiagnosticsへ明記する。
+
+### 3.6 長期候補
 
 - 作物、farmland、deterministic random tick
 - item/minecart/scripted entity movement
 - 液体と機能blockの対応拡大
-- 醸造等のblock entity mechanics
+- 醸造レシピ全種とNucleation下流回路への動的接続
 - ローカルresource pack読込
 - macOS / Linux
 - headless scenario runner
@@ -212,7 +228,6 @@ MVPの利用結果を見て、次の一つの実利用シナリオを選んで�
 | 配置 / 連続配置 | Left click / drag |
 | 削除 / 連続削除 | Right click / drag |
 | pan | Middle drag |
-| スポイト | Middle click |
 | zoom | Wheel |
 | カメラ90度回転 | `Q` / `E` |
 | Y layer移動 | `[` / `]` |
@@ -325,10 +340,9 @@ src/
 ├── main.rs        # 起動のみ
 ├── lib.rs         # integration testから利用する入口
 ├── app.rs         # Bevy / egui / input / projection
+├── brewing.rs     # 限定醸造の決定論的状態機械
 ├── document.rs    # Edit Document / transaction / file I/O
 └── simulation.rs  # Nucleationへの薄い接続
-tests/
-└── vertical_slice.rs
 ```
 
 headless CLIや二つ目のbackendが実際に必要になった時点で、初めてcrate分割またはtraitを検討する。
@@ -342,7 +356,7 @@ headless CLIや二つ目のbackendが実際に必要になった時点で、初�
 
 Nucleationの`meshing`/`rendering` featureは、AGPL-3.0-onlyのSchematic-Mesherを取り込むため有効にしない。描画はBevyのwindow、3D、input、pickingを使い、Tauri、Tokio、独立したwinit/wgpuを追加しない。最初は可視blockごとの単純entityでよく、chunking、greedy meshing、instancingは計測で不足した場合だけ追加する。
 
-Gate 0は同期実行でよい。Gate 2の連続simulationだけは、一つの`std::thread`とboundedな`std::sync::mpsc::sync_channel`へ分離し、UI threadを止めない。汎用worker frameworkは作らず、mesh生成とI/Oは計測で停止が観測された処理だけをBevy task poolへ移す。
+現行規模ではsimulation stepを同期実行してもUI停止が観測されないため、worker threadは導入していない。実利用fixtureで停止が観測された処理だけをBevy task poolまたは一つの`std::thread`へ移す。
 
 ## 8. ファイル・安全性
 
@@ -371,11 +385,12 @@ MVPの編集・保存保証はsingle-region `.litematic`に限定する。multi-
 
 ### 9.1 最小の自動確認
 
-MVPでは独自scenario DSL、GUI test editor、JUnit出力を作らない。通常のRust integration testで次の三つを確認する。
+MVPでは独自scenario DSL、GUI test editor、JUnit出力を作らない。通常のRust unit testで次を確認する。
 
 1. button操作からtickを進め、fixtureのPiston/lamp状態が期待値になる
 2. supported BlockStateの `.litematic` round-tripが一致する
 3. 複数セルtransactionのundo/redoとsave失敗時の非破壊性
+4. container inventory、dispenser / water、限定醸造、potion NBTのround-trip
 
 Nucleation自体が持つMinecraft captureとのconformanceを再実装せず、RedForge側では固定revisionとの接続部分を検証する。
 
@@ -412,7 +427,7 @@ Nucleation自体が持つMinecraft captureとのconformanceを再実装せず、
 | 最低100種類のblock | 二つの代表回路を作れる最小集合 |
 | Milestone 0〜3がMVP | Gate 0〜2。inventory/waterはBeta |
 | pressure plateはMVP、entity接触は後期 | 同じMechanism Betaへ揃える |
-| 醸造台を優先詳細設計 | 利用シナリオが決まるまで長期候補 |
+| 醸造台を優先詳細設計 | 当初は延期し、ユーザー指定後に限定拡張として前倒し実装 |
 | `Raw` settle mode | 現行Nucleation文書に合わせ`Quiet` |
 | 対象Minecraft versionが未確定 | MVPはJava 26.2 / DataVersion 4903へ固定 |
 | macOS/Linuxを同時対象 | Windows 11 x64から開始 |
@@ -423,7 +438,7 @@ Nucleation自体が持つMinecraft captureとのconformanceを再実装せず、
 
 | 未確定事項 | 決める時期 |
 |---|---|
-| Nucleation v0.10.14のtick bridgeがRustから実用可能か | Gate 0のcompile/API probe |
+| Nucleation v0.10.14のtick bridgeがRustから実用可能か | Gate 0で実用可能と確認済み |
 | Minecraft version更新 | Redstone MVP後、version別fixtureを用意できる時 |
 | 1 block = 1 entityで足りる規模 | Gate 1の性能計測後 |
 | Orbitでの自由配置が必要か | Design Alphaのユーザーテスト後 |
