@@ -5,7 +5,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nucleation::{UniversalSchematic, formats::litematic};
+use nucleation::{
+    UniversalSchematic,
+    block_entity::BlockEntity,
+    block_position::BlockPosition,
+    formats::litematic,
+    utils::{NbtMap, NbtValue},
+};
 
 use crate::DATA_VERSION;
 
@@ -27,15 +33,31 @@ impl BlockPos {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CellChange {
     pub pos: BlockPos,
     pub before: String,
     pub after: String,
+    before_entity: Option<BlockEntity>,
+    after_entity: Option<BlockEntity>,
 }
 
-#[derive(Clone, Debug, Default)]
-struct Transaction(Vec<CellChange>);
+#[derive(Clone, Debug)]
+enum Transaction {
+    Cells(Vec<CellChange>),
+    Inventory {
+        pos: BlockPos,
+        before: Vec<InventoryItem>,
+        after: Vec<InventoryItem>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InventoryItem {
+    pub slot: u8,
+    pub id: String,
+    pub count: u8,
+}
 
 pub struct Document {
     schematic: UniversalSchematic,
@@ -132,7 +154,17 @@ impl Document {
             let after = state.as_ref().to_owned();
             let before = self.block(pos);
             if before != after {
-                changes.push(CellChange { pos, before, after });
+                let before_entity = self.schematic.get_block_entity_owned(block_position(pos));
+                let after_entity = (block_name(&before) == block_name(&after))
+                    .then(|| before_entity.clone())
+                    .flatten();
+                changes.push(CellChange {
+                    pos,
+                    before,
+                    after,
+                    before_entity,
+                    after_entity,
+                });
             }
         }
         if changes.is_empty() {
@@ -140,7 +172,7 @@ impl Document {
         }
         self.write_changes(&changes, false)?;
         let count = changes.len();
-        self.undo.push(Transaction(changes));
+        self.undo.push(Transaction::Cells(changes));
         if self.undo.len() > HISTORY_LIMIT {
             self.undo.remove(0);
         }
@@ -153,7 +185,7 @@ impl Document {
         let Some(transaction) = self.undo.pop() else {
             return Ok(false);
         };
-        self.write_changes(&transaction.0, true)?;
+        self.write_transaction(&transaction, true)?;
         self.redo.push(transaction);
         self.changed();
         Ok(true)
@@ -163,7 +195,7 @@ impl Document {
         let Some(transaction) = self.redo.pop() else {
             return Ok(false);
         };
-        self.write_changes(&transaction.0, false)?;
+        self.write_transaction(&transaction, false)?;
         self.undo.push(transaction);
         self.changed();
         Ok(true)
@@ -251,6 +283,88 @@ impl Document {
             .collect()
     }
 
+    pub fn inventory_slot_count(&self, pos: BlockPos) -> Option<usize> {
+        match block_name(&self.block(pos)) {
+            "minecraft:hopper" | "minecraft:brewing_stand" => Some(5),
+            "minecraft:dispenser" | "minecraft:dropper" => Some(9),
+            "minecraft:barrel" | "minecraft:chest" => Some(27),
+            _ => None,
+        }
+    }
+
+    pub fn inventory(&self, pos: BlockPos) -> Vec<InventoryItem> {
+        let Some(entity) = self.schematic.get_block_entity_owned(block_position(pos)) else {
+            return Vec::new();
+        };
+        let Some(NbtValue::List(items)) = entity.nbt.get("Items") else {
+            return Vec::new();
+        };
+        let mut result: Vec<_> = items
+            .iter()
+            .filter_map(|item| {
+                let NbtValue::Compound(item) = item else {
+                    return None;
+                };
+                let id = item
+                    .get("id")
+                    .or_else(|| item.get("Id"))?
+                    .as_string()?
+                    .clone();
+                let slot = nbt_integer(item.get("Slot").or_else(|| item.get("slot"))?)? as u8;
+                let count = nbt_integer(item.get("Count").or_else(|| item.get("count"))?)? as u8;
+                Some(InventoryItem { slot, id, count })
+            })
+            .collect();
+        result.sort_by_key(|item| item.slot);
+        result
+    }
+
+    pub fn set_inventory(
+        &mut self,
+        pos: BlockPos,
+        items: Vec<InventoryItem>,
+    ) -> Result<bool, String> {
+        let slots = self
+            .inventory_slot_count(pos)
+            .ok_or_else(|| format!("{} は編集可能なcontainerではありません", self.block(pos)))?;
+        let mut seen = HashSet::new();
+        for item in &items {
+            if usize::from(item.slot) >= slots {
+                return Err(format!(
+                    "slot {} は範囲外です（0..{}）",
+                    item.slot,
+                    slots - 1
+                ));
+            }
+            if item.id.trim().is_empty() || item.count == 0 || item.count > 64 {
+                return Err(format!("slot {} のitem ID/countが不正です", item.slot));
+            }
+            if !seen.insert(item.slot) {
+                return Err(format!("slot {} が重複しています", item.slot));
+            }
+        }
+        let before = self.inventory(pos);
+        let mut after = items;
+        for item in &mut after {
+            if !item.id.contains(':') {
+                item.id = format!("minecraft:{}", item.id);
+            }
+        }
+        after.sort_by_key(|item| item.slot);
+        if before == after {
+            return Ok(false);
+        }
+        self.write_inventory(pos, &after)?;
+        self.undo
+            .push(Transaction::Inventory { pos, before, after });
+        if self.undo.len() > HISTORY_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.changed();
+        Ok(true)
+    }
+
     pub(crate) fn schematic(&self) -> &UniversalSchematic {
         &self.schematic
     }
@@ -262,21 +376,87 @@ impl Document {
 
     fn write_changes(&mut self, changes: &[CellChange], reverse: bool) -> Result<(), String> {
         for change in changes {
-            let state = if reverse {
-                &change.before
+            let (state, entity) = if reverse {
+                (&change.before, &change.before_entity)
             } else {
-                &change.after
+                (&change.after, &change.after_entity)
             };
             self.schematic
                 .try_set_block_str(change.pos.x, change.pos.y, change.pos.z, state)
                 .map_err(|error| format!("BlockState {state} を配置できません: {error}"))?;
+            if let Some(entity) = entity {
+                self.schematic
+                    .set_block_entity(block_position(change.pos), entity.clone());
+            } else {
+                self.schematic
+                    .remove_block_entity((change.pos.x, change.pos.y, change.pos.z));
+            }
         }
+        Ok(())
+    }
+
+    fn write_transaction(
+        &mut self,
+        transaction: &Transaction,
+        reverse: bool,
+    ) -> Result<(), String> {
+        match transaction {
+            Transaction::Cells(changes) => self.write_changes(changes, reverse),
+            Transaction::Inventory { pos, before, after } => {
+                self.write_inventory(*pos, if reverse { before } else { after })
+            }
+        }
+    }
+
+    fn write_inventory(&mut self, pos: BlockPos, items: &[InventoryItem]) -> Result<(), String> {
+        let block = self.block(pos);
+        self.inventory_slot_count(pos)
+            .ok_or_else(|| format!("{block} はcontainerではありません"))?;
+        let mut entity = self
+            .schematic
+            .get_block_entity_owned(block_position(pos))
+            .unwrap_or_else(|| BlockEntity::new(block_name(&block).to_owned(), pos_tuple(pos)));
+        let items = items
+            .iter()
+            .map(|item| {
+                let mut nbt = NbtMap::new();
+                nbt.insert("id".to_owned(), NbtValue::String(item.id.clone()));
+                nbt.insert("Count".to_owned(), NbtValue::Byte(item.count as i8));
+                nbt.insert("Slot".to_owned(), NbtValue::Byte(item.slot as i8));
+                NbtValue::Compound(nbt)
+            })
+            .collect();
+        entity
+            .nbt_mut()
+            .insert("Items".to_owned(), NbtValue::List(items));
+        self.schematic.set_block_entity(block_position(pos), entity);
         Ok(())
     }
 
     fn changed(&mut self) {
         self.dirty = true;
         self.revision = self.revision.wrapping_add(1);
+    }
+}
+
+fn block_position(pos: BlockPos) -> BlockPosition {
+    BlockPosition::new(pos.x, pos.y, pos.z)
+}
+
+fn pos_tuple(pos: BlockPos) -> (i32, i32, i32) {
+    (pos.x, pos.y, pos.z)
+}
+
+fn block_name(state: &str) -> &str {
+    state.split('[').next().unwrap_or(state)
+}
+
+fn nbt_integer(value: &NbtValue) -> Option<i32> {
+    match value {
+        NbtValue::Byte(value) => Some(i32::from(*value)),
+        NbtValue::Short(value) => Some(i32::from(*value)),
+        NbtValue::Int(value) => Some(*value),
+        _ => None,
     }
 }
 
@@ -359,5 +539,35 @@ mod tests {
         .unwrap();
         assert!(wire.contains("east=up"));
         assert!(wire.contains("south=side"));
+    }
+
+    #[test]
+    fn container_inventory_undo_and_round_trip() {
+        let mut document = Document::new("inventory");
+        let pos = BlockPos::new(2, 3, 4);
+        document
+            .apply_cells([(pos, "minecraft:hopper[enabled=true,facing=down]")])
+            .unwrap();
+        let items = vec![InventoryItem {
+            slot: 0,
+            id: "minecraft:redstone".to_owned(),
+            count: 3,
+        }];
+        assert!(document.set_inventory(pos, items.clone()).unwrap());
+        assert_eq!(document.inventory(pos), items);
+        assert!(document.undo().unwrap());
+        assert!(document.inventory(pos).is_empty());
+        assert!(document.redo().unwrap());
+        assert_eq!(document.inventory(pos), items);
+
+        let path = std::env::temp_dir().join(format!(
+            "redforge-inventory-{}-{}.litematic",
+            std::process::id(),
+            document.revision
+        ));
+        document.save(&path).unwrap();
+        let loaded = Document::open(&path).unwrap();
+        assert_eq!(loaded.inventory(pos), items);
+        fs::remove_file(path).unwrap();
     }
 }

@@ -20,7 +20,7 @@ use bevy_egui::{
 
 use crate::{
     APP_NAME,
-    document::{BlockPos, Document, rotate_state_y},
+    document::{BlockPos, Document, InventoryItem, rotate_state_y},
     simulation::{RedstoneSimulation, SettleMode},
 };
 
@@ -90,6 +90,10 @@ const PALETTE: &[PaletteItem] = &[
         state: "minecraft:hopper[enabled=true,facing=down]",
     },
     PaletteItem {
+        label: "Barrel",
+        state: "minecraft:barrel[facing=north,open=false]",
+    },
+    PaletteItem {
         label: "Dispenser",
         state: "minecraft:dispenser[facing=north,triggered=false]",
     },
@@ -106,6 +110,26 @@ const PALETTE: &[PaletteItem] = &[
         state: "minecraft:oak_pressure_plate[powered=false]",
     },
     PaletteItem {
+        label: "Stone Pressure Plate",
+        state: "minecraft:stone_pressure_plate[powered=false]",
+    },
+    PaletteItem {
+        label: "Light Weighted Plate",
+        state: "minecraft:light_weighted_pressure_plate[power=0]",
+    },
+    PaletteItem {
+        label: "Heavy Weighted Plate",
+        state: "minecraft:heavy_weighted_pressure_plate[power=0]",
+    },
+    PaletteItem {
+        label: "Farmland (static)",
+        state: "minecraft:farmland[moisture=7]",
+    },
+    PaletteItem {
+        label: "Wheat (static)",
+        state: "minecraft:wheat[age=7]",
+    },
+    PaletteItem {
         label: "Brewing Stand",
         state: "minecraft:brewing_stand[has_bottle_0=false,has_bottle_1=false,has_bottle_2=false]",
     },
@@ -119,6 +143,8 @@ struct Editor {
     selection: Option<(BlockPos, BlockPos)>,
     selection_anchor: Option<BlockPos>,
     clipboard: Vec<(BlockPos, String)>,
+    inventory_for: Option<BlockPos>,
+    inventory_draft: Vec<InventoryItem>,
     active_layer: i32,
     paint_state: String,
     palette_index: usize,
@@ -150,6 +176,8 @@ impl Editor {
         self.selected = None;
         self.selection = None;
         self.selection_anchor = None;
+        self.inventory_for = None;
+        self.inventory_draft.clear();
         self.scene_epoch = self.scene_epoch.wrapping_add(1);
         self.confirm_discard = false;
     }
@@ -226,6 +254,8 @@ pub fn run() {
             selection: None,
             selection_anchor: None,
             clipboard: Vec::new(),
+            inventory_for: None,
+            inventory_draft: Vec::new(),
             active_layer: 1,
             paint_state: PALETTE[1].state.to_owned(),
             palette_index: 1,
@@ -883,6 +913,7 @@ fn editor_ui(
         configure_fonts(ctx);
         *fonts_configured = true;
     }
+    sync_inventory_editor(&mut editor);
     let mut root = egui::Ui::new(
         ctx.clone(),
         "root".into(),
@@ -984,6 +1015,42 @@ fn editor_ui(
                     .map(|simulation| simulation.block(pos))
                     .unwrap_or_else(|| editor.document.block(pos));
                 ui.monospace(state);
+                if editor.document.inventory_slot_count(pos).is_some() {
+                    ui.collapsing("Inventory", |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for item in &mut editor.inventory_draft {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("{}", item.slot));
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut item.id)
+                                                .desired_width(145.0),
+                                        );
+                                        ui.add(egui::DragValue::new(&mut item.count).range(0..=64));
+                                    });
+                                }
+                            });
+                        if ui.button("Inventoryを適用").clicked() {
+                            let items: Vec<_> = editor
+                                .inventory_draft
+                                .iter()
+                                .filter(|item| !item.id.trim().is_empty() && item.count > 0)
+                                .cloned()
+                                .collect();
+                            match editor.document.set_inventory(pos, items) {
+                                Ok(true) => {
+                                    editor.message = "Inventoryを更新しました".to_owned();
+                                    editor.simulation = None;
+                                    editor.running = false;
+                                    editor.inventory_for = None;
+                                }
+                                Ok(false) => editor.message = "Inventoryは変更なしです".to_owned(),
+                                Err(error) => editor.message = error,
+                            }
+                        }
+                    });
+                }
             } else {
                 ui.label("セルを選択してください");
             }
@@ -1130,6 +1197,34 @@ fn editor_ui(
             });
     }
     Ok(())
+}
+
+fn sync_inventory_editor(editor: &mut Editor) {
+    if editor.inventory_for == editor.selected {
+        return;
+    }
+    editor.inventory_for = editor.selected;
+    editor.inventory_draft.clear();
+    let Some(pos) = editor.selected else {
+        return;
+    };
+    let Some(slots) = editor.document.inventory_slot_count(pos) else {
+        return;
+    };
+    let existing = editor.document.inventory(pos);
+    for slot in 0..slots {
+        editor.inventory_draft.push(
+            existing
+                .iter()
+                .find(|item| usize::from(item.slot) == slot)
+                .cloned()
+                .unwrap_or(InventoryItem {
+                    slot: slot as u8,
+                    id: String::new(),
+                    count: 0,
+                }),
+        );
+    }
 }
 
 fn configure_fonts(ctx: &egui::Context) {

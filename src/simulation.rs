@@ -221,6 +221,7 @@ fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::InventoryItem;
 
     #[test]
     fn gate_zero_fixture_reaches_tick_engine() {
@@ -316,6 +317,84 @@ mod tests {
                     && change.to.contains("extended=true")
             }),
             "changes={changes:?}"
+        );
+    }
+
+    #[test]
+    fn container_inventory_drives_comparator() {
+        let mut document = Document::new("container-comparator");
+        document
+            .apply_cells([
+                (BlockPos::new(0, 0, 0), "minecraft:stone"),
+                (BlockPos::new(1, 0, 0), "minecraft:stone"),
+                (BlockPos::new(2, 0, 0), "minecraft:stone"),
+                (
+                    BlockPos::new(0, 1, 0),
+                    "minecraft:hopper[enabled=true,facing=down]",
+                ),
+                (
+                    BlockPos::new(1, 1, 0),
+                    "minecraft:comparator[facing=west,mode=compare,powered=false]",
+                ),
+                (
+                    BlockPos::new(2, 1, 0),
+                    "minecraft:redstone_wire[east=none,north=none,power=0,south=none,west=side]",
+                ),
+            ])
+            .unwrap();
+        document
+            .set_inventory(
+                BlockPos::new(0, 1, 0),
+                vec![InventoryItem {
+                    slot: 0,
+                    id: "minecraft:redstone".to_owned(),
+                    count: 64,
+                }],
+            )
+            .unwrap();
+        let mut simulation =
+            RedstoneSimulation::start(&document, SettleMode::Placement, 0).unwrap();
+        simulation.run(2);
+        let dust = simulation.block(BlockPos::new(2, 1, 0));
+        assert!(!dust.contains("power=0"), "dust={dust}");
+    }
+
+    #[test]
+    fn dispenser_can_place_water_from_inventory() {
+        let mut document = Document::new("dispenser-water");
+        document
+            .apply_cells([
+                (BlockPos::new(0, 0, 0), "minecraft:stone"),
+                (BlockPos::new(1, 0, 0), "minecraft:stone"),
+                (
+                    BlockPos::new(0, 1, 0),
+                    "minecraft:lever[face=floor,facing=east,powered=false]",
+                ),
+                (
+                    BlockPos::new(1, 1, 0),
+                    "minecraft:dispenser[facing=east,triggered=false]",
+                ),
+            ])
+            .unwrap();
+        document
+            .set_inventory(
+                BlockPos::new(1, 1, 0),
+                vec![InventoryItem {
+                    slot: 0,
+                    id: "minecraft:water_bucket".to_owned(),
+                    count: 1,
+                }],
+            )
+            .unwrap();
+        let mut simulation = RedstoneSimulation::start(&document, SettleMode::InWorld, 0).unwrap();
+        simulation.use_block(BlockPos::new(0, 1, 0));
+        simulation.run(4);
+        assert!(
+            simulation
+                .block(BlockPos::new(2, 1, 0))
+                .starts_with("minecraft:water"),
+            "changes={:?}",
+            simulation.changes().unwrap()
         );
     }
 }
