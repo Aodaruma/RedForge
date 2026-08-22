@@ -125,6 +125,10 @@ struct Editor {
     tool: Tool,
     camera: CameraPreset,
     settle_mode: SettleMode,
+    running: bool,
+    ticks_per_second: f32,
+    tick_accumulator: f32,
+    probe_history: Vec<(u32, String)>,
     file_path: String,
     message: String,
     scene_epoch: u64,
@@ -141,6 +145,8 @@ impl Editor {
             .unwrap_or_else(|| "design.litematic".to_owned());
         self.document = document;
         self.simulation = None;
+        self.running = false;
+        self.probe_history.clear();
         self.selected = None;
         self.selection = None;
         self.selection_anchor = None;
@@ -165,7 +171,7 @@ enum Tool {
 }
 
 #[derive(Component)]
-struct BlockVisual;
+struct SceneVisual;
 
 #[derive(Component)]
 struct MainCamera;
@@ -184,7 +190,7 @@ type SelectionPreviewQuery<'w, 's> = Single<
 >;
 
 #[derive(Resource, Default)]
-struct RenderedRevision(Option<(u64, u64)>);
+struct RenderedRevision(Option<(u64, u64, Option<u32>, Option<BlockPos>)>);
 
 #[derive(Resource, Default)]
 struct CursorCell(Option<BlockPos>);
@@ -226,6 +232,10 @@ pub fn run() {
             tool: Tool::Paint,
             camera: CameraPreset::Isometric,
             settle_mode: SettleMode::InWorld,
+            running: false,
+            ticks_per_second: 20.0,
+            tick_accumulator: 0.0,
+            probe_history: Vec::new(),
             file_path: "design.litematic".to_owned(),
             message: "Gate 0 fixtureを読み込みました".to_owned(),
             scene_epoch: 0,
@@ -264,7 +274,7 @@ pub fn run() {
                 .run_if(not(egui_wants_any_pointer_input)),
         )
         .add_systems(Update, clear_cursor.run_if(egui_wants_any_pointer_input))
-        .add_systems(Update, (autosave, close_request))
+        .add_systems(Update, (run_simulation, autosave, close_request))
         .add_systems(EguiPrimaryContextPass, editor_ui)
         .run();
 }
@@ -323,31 +333,92 @@ fn sync_scene(
     mut commands: Commands,
     editor: Res<Editor>,
     mut rendered: ResMut<RenderedRevision>,
-    visuals: Query<Entity, With<BlockVisual>>,
+    visuals: Query<Entity, With<SceneVisual>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let signature = (editor.scene_epoch, editor.document.revision);
+    let signature = (
+        editor.scene_epoch,
+        editor.document.revision,
+        editor.simulation.as_ref().map(RedstoneSimulation::tick),
+        editor.selected,
+    );
     if rendered.0 == Some(signature) {
         return;
     }
     for entity in &visuals {
         commands.entity(entity).despawn();
     }
-    for (pos, state) in editor.document.blocks() {
+    let mut positions: BTreeSet<_> = editor
+        .document
+        .blocks()
+        .into_iter()
+        .map(|(pos, _)| pos)
+        .collect();
+    if let Some(simulation) = editor.simulation.as_ref()
+        && let Ok(changes) = simulation.changes()
+    {
+        positions.extend(
+            changes
+                .into_iter()
+                .map(|change| BlockPos::new(change.pos[0], change.pos[1], change.pos[2])),
+        );
+    }
+    for pos in positions {
+        let state = editor
+            .simulation
+            .as_ref()
+            .map(|simulation| simulation.block(pos))
+            .unwrap_or_else(|| editor.document.block(pos));
+        if state == AIR {
+            continue;
+        }
         let (size, offset) = block_shape(&state);
+        let selected = editor.selected == Some(pos);
         commands.spawn((
             Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
             MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: block_color(&state),
+                base_color: if selected {
+                    Color::srgb(0.12, 0.82, 0.92)
+                } else {
+                    block_color(&state)
+                },
+                alpha_mode: if state.starts_with("minecraft:water") {
+                    AlphaMode::Blend
+                } else {
+                    AlphaMode::Opaque
+                },
                 perceptual_roughness: 0.72,
                 ..default()
             })),
             Transform::from_translation(
                 Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32) + offset,
             ),
-            BlockVisual,
+            SceneVisual,
         ));
+        if let Some((rotation, direction)) = facing_marker(&state) {
+            commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.12, 0.1, 0.62))),
+                MeshMaterial3d(materials.add(Color::srgb(0.98, 0.82, 0.16))),
+                Transform {
+                    translation: block_vec3(pos) + Vec3::Y * 0.53 + direction * 0.18,
+                    rotation,
+                    ..default()
+                },
+                SceneVisual,
+            ));
+        }
+        if let Some(power) =
+            state_property(&state, "power").and_then(|value| value.parse::<u8>().ok())
+        {
+            let height = 0.1 + power as f32 / 15.0 * 0.65;
+            commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.12, height, 0.12))),
+                MeshMaterial3d(materials.add(Color::srgb(1.0, 0.25, 0.05))),
+                Transform::from_translation(block_vec3(pos) + Vec3::new(0.34, height * 0.5, 0.34)),
+                SceneVisual,
+            ));
+        }
     }
     rendered.0 = Some(signature);
 }
@@ -614,6 +685,70 @@ fn editor_keys(
             rig.target = focus;
         }
     }
+    if keys.just_pressed(KeyCode::Space) {
+        if editor.simulation.is_none() {
+            start_simulation(&mut editor);
+        } else {
+            editor.running = !editor.running;
+            editor.message = if editor.running {
+                "simulationを実行中".to_owned()
+            } else {
+                "simulationをpauseしました".to_owned()
+            };
+        }
+    }
+    if keys.just_pressed(KeyCode::Period) {
+        step_simulation(&mut editor, 1);
+    }
+}
+
+fn start_simulation(editor: &mut Editor) {
+    match RedstoneSimulation::start(&editor.document, editor.settle_mode, 0) {
+        Ok(simulation) => {
+            editor.message = simulation.summary();
+            editor.simulation = Some(simulation);
+            editor.running = false;
+            editor.tick_accumulator = 0.0;
+            editor.probe_history.clear();
+            editor.scene_epoch = editor.scene_epoch.wrapping_add(1);
+            record_probe(editor);
+        }
+        Err(error) => editor.message = error,
+    }
+}
+
+fn step_simulation(editor: &mut Editor, ticks: u32) {
+    let Some(simulation) = editor.simulation.as_mut() else {
+        return;
+    };
+    simulation.run(ticks);
+    editor.message = format!("tick {}", simulation.tick());
+    record_probe(editor);
+}
+
+fn record_probe(editor: &mut Editor) {
+    let (Some(pos), Some(simulation)) = (editor.selected, editor.simulation.as_ref()) else {
+        return;
+    };
+    editor
+        .probe_history
+        .push((simulation.tick(), simulation.block(pos)));
+    if editor.probe_history.len() > 128 {
+        editor.probe_history.remove(0);
+    }
+}
+
+fn run_simulation(time: Res<Time>, mut editor: ResMut<Editor>) {
+    if !editor.running || editor.simulation.is_none() {
+        return;
+    }
+    editor.tick_accumulator += time.delta_secs() * editor.ticks_per_second;
+    let ticks = editor.tick_accumulator.floor().min(20.0) as u32;
+    if ticks == 0 {
+        return;
+    }
+    editor.tick_accumulator -= ticks as f32;
+    step_simulation(&mut editor, ticks);
 }
 
 fn camera_keys(
@@ -870,32 +1005,82 @@ fn editor_ui(
                 });
             ui.horizontal(|ui| {
                 if ui.button("Start").clicked() {
-                    match RedstoneSimulation::start(&editor.document, editor.settle_mode, 0) {
-                        Ok(simulation) => {
-                            editor.message = simulation.summary();
-                            editor.simulation = Some(simulation);
-                        }
-                        Err(error) => editor.message = error,
-                    }
+                    start_simulation(&mut editor);
                 }
                 if ui.button("Use").clicked()
                     && let (Some(pos), Some(simulation)) =
                         (editor.selected, editor.simulation.as_mut())
                 {
                     simulation.use_block(pos);
+                    editor.scene_epoch = editor.scene_epoch.wrapping_add(1);
+                    record_probe(&mut editor);
                 }
-                if ui.button("Step").clicked()
-                    && let Some(simulation) = editor.simulation.as_mut()
+                if ui.button("Step").clicked() {
+                    step_simulation(&mut editor, 1);
+                }
+                if ui
+                    .button(if editor.running { "Pause" } else { "Run" })
+                    .clicked()
+                    && editor.simulation.is_some()
                 {
-                    simulation.step();
-                    editor.message = format!("tick {}", simulation.tick());
+                    editor.running = !editor.running;
                 }
                 if ui.button("Reset").clicked() {
                     editor.simulation = None;
+                    editor.running = false;
+                    editor.probe_history.clear();
+                    editor.scene_epoch = editor.scene_epoch.wrapping_add(1);
                 }
             });
+            ui.add(egui::Slider::new(&mut editor.ticks_per_second, 1.0..=100.0).text("ticks/sec"));
             if let Some(simulation) = editor.simulation.as_ref() {
-                ui.label(format!("tick {}", simulation.tick()));
+                ui.label(format!(
+                    "tick {} / {} changes / {}",
+                    simulation.tick(),
+                    simulation.change_count(),
+                    if simulation.is_quiescent() {
+                        "quiet"
+                    } else {
+                        "scheduled"
+                    }
+                ));
+                if let Ok(changes) = simulation.changes() {
+                    ui.collapsing("Block changes", |ui| {
+                        for change in changes.iter().rev().take(12).rev() {
+                            ui.small(format!(
+                                "t{} ({},{},{}) {} → {}",
+                                change.tick,
+                                change.pos[0],
+                                change.pos[1],
+                                change.pos[2],
+                                short_state(&change.from),
+                                short_state(&change.to)
+                            ));
+                        }
+                    });
+                }
+            }
+            if !editor.probe_history.is_empty() {
+                ui.collapsing("Selected probe", |ui| {
+                    for (tick, state) in editor.probe_history.iter().rev().take(8).rev() {
+                        ui.small(format!("t{tick}: {}", short_state(state)));
+                    }
+                });
+            }
+            let diagnostics = crate::simulation::diagnostics(&editor.document);
+            if !diagnostics.is_empty() {
+                ui.collapsing(format!("Diagnostics ({})", diagnostics.len()), |ui| {
+                    for diagnostic in diagnostics.iter().take(8) {
+                        ui.small(format!(
+                            "{:?} ({},{},{}): {}",
+                            diagnostic.level,
+                            diagnostic.pos.x,
+                            diagnostic.pos.y,
+                            diagnostic.pos.z,
+                            diagnostic.message
+                        ));
+                    }
+                });
             }
         });
     egui::Panel::bottom("status").show(&mut root, |ui| {
@@ -1005,6 +1190,36 @@ fn block_vec3(pos: BlockPos) -> Vec3 {
     Vec3::new(pos.x as f32, pos.y as f32, pos.z as f32)
 }
 
+fn state_property<'a>(state: &'a str, key: &str) -> Option<&'a str> {
+    let properties = state.split_once('[')?.1.strip_suffix(']')?;
+    properties.split(',').find_map(|pair| {
+        let (candidate, value) = pair.split_once('=')?;
+        (candidate == key).then_some(value)
+    })
+}
+
+fn facing_marker(state: &str) -> Option<(Quat, Vec3)> {
+    let facing = state_property(state, "facing")?;
+    Some(match facing {
+        "north" => (Quat::IDENTITY, Vec3::NEG_Z),
+        "east" => (Quat::from_rotation_y(FRAC_PI_2), Vec3::X),
+        "south" => (Quat::from_rotation_y(std::f32::consts::PI), Vec3::Z),
+        "west" => (Quat::from_rotation_y(-FRAC_PI_2), Vec3::NEG_X),
+        "up" => (Quat::from_rotation_x(FRAC_PI_2), Vec3::Y),
+        "down" => (Quat::from_rotation_x(FRAC_PI_2), Vec3::NEG_Y),
+        _ => return None,
+    })
+}
+
+fn short_state(state: &str) -> String {
+    let state = state.strip_prefix("minecraft:").unwrap_or(state);
+    if state.chars().count() > 52 {
+        format!("{}…", state.chars().take(51).collect::<String>())
+    } else {
+        state.to_owned()
+    }
+}
+
 fn block_shape(state: &str) -> (Vec3, Vec3) {
     if state.contains("redstone_wire") || state.contains("pressure_plate") {
         (Vec3::new(0.82, 0.06, 0.82), Vec3::new(0.0, -0.43, 0.0))
@@ -1024,8 +1239,17 @@ fn block_shape(state: &str) -> (Vec3, Vec3) {
 }
 
 fn block_color(state: &str) -> Color {
-    if state.contains("redstone_wire") || state.contains("redstone_block") {
-        Color::srgb(0.72, 0.04, 0.035)
+    if state.contains("redstone_wire") {
+        let power = state_property(state, "power")
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(0.0);
+        Color::srgb(0.3 + power / 15.0 * 0.65, 0.025, 0.02)
+    } else if state.contains("redstone_block") {
+        Color::srgb(0.82, 0.04, 0.035)
+    } else if state.contains("lamp") && state.contains("lit=true") {
+        Color::srgb(1.0, 0.76, 0.12)
+    } else if state.contains("powered=true") {
+        Color::srgb(1.0, 0.28, 0.08)
     } else if state.contains("torch") {
         Color::srgb(0.95, 0.18, 0.08)
     } else if state.contains("repeater") {
