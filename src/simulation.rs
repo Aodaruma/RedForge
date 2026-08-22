@@ -51,7 +51,8 @@ pub struct RedstoneSimulation {
 
 impl RedstoneSimulation {
     pub fn start(document: &Document, mode: SettleMode, seed: i64) -> Result<Self, String> {
-        let bytes = litematic::to_litematic(document.schematic())
+        let simulation_schematic = document.simulation_schematic();
+        let bytes = litematic::to_litematic(&simulation_schematic)
             .map_err(|error| format!("simulation snapshotを作れません: {error}"))?;
         let schematic = Schematic::from_litematic(&bytes)
             .map_err(|error| format!("simulation snapshotを読めません: {error:?}"))?;
@@ -345,11 +346,7 @@ mod tests {
         document
             .set_inventory(
                 BlockPos::new(0, 1, 0),
-                vec![InventoryItem {
-                    slot: 0,
-                    id: "minecraft:redstone".to_owned(),
-                    count: 64,
-                }],
+                vec![InventoryItem::new(0, "minecraft:redstone", 64)],
             )
             .unwrap();
         let mut simulation =
@@ -379,11 +376,7 @@ mod tests {
         document
             .set_inventory(
                 BlockPos::new(1, 1, 0),
-                vec![InventoryItem {
-                    slot: 0,
-                    id: "minecraft:water_bucket".to_owned(),
-                    count: 1,
-                }],
+                vec![InventoryItem::new(0, "minecraft:water_bucket", 1)],
             )
             .unwrap();
         let mut simulation = RedstoneSimulation::start(&document, SettleMode::InWorld, 0).unwrap();
@@ -396,5 +389,29 @@ mod tests {
             "changes={:?}",
             simulation.changes().unwrap()
         );
+    }
+
+    #[test]
+    fn brewing_inventory_is_safely_excluded_from_tick_engine() {
+        let mut document = Document::new("brewing-snapshot");
+        let pos = BlockPos::new(0, 1, 0);
+        document
+            .apply_cells([(
+                pos,
+                "minecraft:brewing_stand[has_bottle_0=false,has_bottle_1=false,has_bottle_2=false]",
+            )])
+            .unwrap();
+        document
+            .set_inventory(
+                pos,
+                vec![
+                    InventoryItem::new(0, "minecraft:potion", 1).with_potion("minecraft:water"),
+                    InventoryItem::new(3, "minecraft:nether_wart", 1),
+                ],
+            )
+            .unwrap();
+        let mut simulation = RedstoneSimulation::start(&document, SettleMode::InWorld, 0).unwrap();
+        simulation.step();
+        assert!(simulation.block(pos).starts_with("minecraft:brewing_stand"));
     }
 }

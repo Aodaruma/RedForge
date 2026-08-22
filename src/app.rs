@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     f32::consts::FRAC_PI_2,
     path::{Path, PathBuf},
     sync::Arc,
@@ -20,6 +20,7 @@ use bevy_egui::{
 
 use crate::{
     APP_NAME,
+    brewing::{BrewEvent, BrewingStand},
     document::{BlockPos, Document, InventoryItem, rotate_state_y},
     simulation::{RedstoneSimulation, SettleMode},
 };
@@ -145,6 +146,8 @@ struct Editor {
     clipboard: Vec<(BlockPos, String)>,
     inventory_for: Option<BlockPos>,
     inventory_draft: Vec<InventoryItem>,
+    brewing: BTreeMap<BlockPos, BrewingStand>,
+    brewing_log: Vec<String>,
     active_layer: i32,
     paint_state: String,
     palette_index: usize,
@@ -178,6 +181,8 @@ impl Editor {
         self.selection_anchor = None;
         self.inventory_for = None;
         self.inventory_draft.clear();
+        self.brewing.clear();
+        self.brewing_log.clear();
         self.scene_epoch = self.scene_epoch.wrapping_add(1);
         self.confirm_discard = false;
     }
@@ -256,6 +261,8 @@ pub fn run() {
             clipboard: Vec::new(),
             inventory_for: None,
             inventory_draft: Vec::new(),
+            brewing: BTreeMap::new(),
+            brewing_log: Vec::new(),
             active_layer: 1,
             paint_state: PALETTE[1].state.to_owned(),
             palette_index: 1,
@@ -405,13 +412,23 @@ fn sync_scene(
         }
         let (size, offset) = block_shape(&state);
         let selected = editor.selected == Some(pos);
+        let color = if let Some(stand) = editor.brewing.get(&pos) {
+            let progress = stand.progress();
+            Color::srgb(
+                0.45 - progress * 0.15,
+                0.3 + progress * 0.35,
+                0.42 + progress * 0.35,
+            )
+        } else {
+            block_color(&state)
+        };
         commands.spawn((
             Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
             MeshMaterial3d(materials.add(StandardMaterial {
                 base_color: if selected {
                     Color::srgb(0.12, 0.82, 0.92)
                 } else {
-                    block_color(&state)
+                    color
                 },
                 alpha_mode: if state.starts_with("minecraft:water") {
                     AlphaMode::Blend
@@ -446,6 +463,16 @@ fn sync_scene(
                 Mesh3d(meshes.add(Cuboid::new(0.12, height, 0.12))),
                 MeshMaterial3d(materials.add(Color::srgb(1.0, 0.25, 0.05))),
                 Transform::from_translation(block_vec3(pos) + Vec3::new(0.34, height * 0.5, 0.34)),
+                SceneVisual,
+            ));
+        }
+        if let Some(stand) = editor.brewing.get(&pos) {
+            let output = stand.comparator_output();
+            let height = 0.08 + f32::from(output) / 15.0 * 0.62;
+            commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.1, height, 0.1))),
+                MeshMaterial3d(materials.add(Color::srgb(0.78, 0.18, 0.92))),
+                Transform::from_translation(block_vec3(pos) + Vec3::new(-0.35, height * 0.5, 0.35)),
                 SceneVisual,
             ));
         }
@@ -564,6 +591,8 @@ fn begin_drag(editor: &mut Editor, drag: &mut PaintDrag, button: MouseButton, ce
     if editor.simulation.take().is_some() {
         editor.message = "編集を開始したためsimulation snapshotを破棄しました".to_owned();
     }
+    editor.brewing.clear();
+    editor.brewing_log.clear();
     drag.button = Some(button);
     drag.cells.clear();
     drag.cells.insert(cell);
@@ -640,6 +669,8 @@ fn editor_keys(
             editor.message = error;
         }
         editor.simulation = None;
+        editor.brewing.clear();
+        editor.brewing_log.clear();
     }
     if ctrl
         && keys.just_pressed(KeyCode::KeyC)
@@ -735,6 +766,20 @@ fn editor_keys(
 fn start_simulation(editor: &mut Editor) {
     match RedstoneSimulation::start(&editor.document, editor.settle_mode, 0) {
         Ok(simulation) => {
+            editor.brewing = editor
+                .document
+                .blocks()
+                .into_iter()
+                .filter(|(_, state)| state.starts_with("minecraft:brewing_stand"))
+                .map(|(pos, _)| {
+                    let (brew_time, fuel) = editor.document.brewing_timers(pos);
+                    (
+                        pos,
+                        BrewingStand::new(editor.document.inventory(pos), brew_time, fuel),
+                    )
+                })
+                .collect();
+            editor.brewing_log.clear();
             editor.message = simulation.summary();
             editor.simulation = Some(simulation);
             editor.running = false;
@@ -748,11 +793,33 @@ fn start_simulation(editor: &mut Editor) {
 }
 
 fn step_simulation(editor: &mut Editor, ticks: u32) {
-    let Some(simulation) = editor.simulation.as_mut() else {
+    if editor.simulation.is_none() {
         return;
-    };
-    simulation.run(ticks);
-    editor.message = format!("tick {}", simulation.tick());
+    }
+    for _ in 0..ticks {
+        let tick = {
+            let simulation = editor.simulation.as_mut().expect("checked above");
+            simulation.step();
+            simulation.tick()
+        };
+        for (pos, stand) in &mut editor.brewing {
+            if let Some(event) = stand.tick() {
+                editor.brewing_log.push(format!(
+                    "t{tick} ({},{},{}): {}",
+                    pos.x,
+                    pos.y,
+                    pos.z,
+                    brew_event_label(event)
+                ));
+            }
+        }
+    }
+    if editor.brewing_log.len() > 64 {
+        editor.brewing_log.drain(..editor.brewing_log.len() - 64);
+    }
+    let tick = editor.simulation.as_ref().expect("checked above").tick();
+    editor.message = format!("tick {tick}");
+    editor.scene_epoch = editor.scene_epoch.wrapping_add(1);
     record_probe(editor);
 }
 
@@ -955,6 +1022,8 @@ fn editor_ui(
                     editor.message = error;
                 }
                 editor.simulation = None;
+                editor.brewing.clear();
+                editor.brewing_log.clear();
             }
             if ui
                 .add_enabled(editor.document.can_redo(), egui::Button::new("Redo"))
@@ -964,6 +1033,8 @@ fn editor_ui(
                     editor.message = error;
                 }
                 editor.simulation = None;
+                editor.brewing.clear();
+                editor.brewing_log.clear();
             }
             ui.separator();
             ui.selectable_value(&mut editor.camera, CameraPreset::Top, "Top");
@@ -1017,6 +1088,36 @@ fn editor_ui(
                 ui.monospace(state);
                 if editor.document.inventory_slot_count(pos).is_some() {
                     ui.collapsing("Inventory", |ui| {
+                        if editor
+                            .document
+                            .block(pos)
+                            .starts_with("minecraft:brewing_stand")
+                        {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Preset:");
+                                if ui.button("水→奇妙").clicked() {
+                                    brewing_preset(
+                                        &mut editor.inventory_draft,
+                                        "minecraft:water",
+                                        "minecraft:nether_wart",
+                                    );
+                                }
+                                if ui.button("奇妙→俊敏").clicked() {
+                                    brewing_preset(
+                                        &mut editor.inventory_draft,
+                                        "minecraft:awkward",
+                                        "minecraft:sugar",
+                                    );
+                                }
+                                if ui.button("俊敏→延長").clicked() {
+                                    brewing_preset(
+                                        &mut editor.inventory_draft,
+                                        "minecraft:swiftness",
+                                        "minecraft:redstone",
+                                    );
+                                }
+                            });
+                        }
                         egui::ScrollArea::vertical()
                             .max_height(220.0)
                             .show(ui, |ui| {
@@ -1029,6 +1130,9 @@ fn editor_ui(
                                         );
                                         ui.add(egui::DragValue::new(&mut item.count).range(0..=64));
                                     });
+                                    if let Some(potion) = item.potion() {
+                                        ui.small(format!("  potion: {potion}"));
+                                    }
                                 }
                             });
                         if ui.button("Inventoryを適用").clicked() {
@@ -1042,6 +1146,8 @@ fn editor_ui(
                                 Ok(true) => {
                                     editor.message = "Inventoryを更新しました".to_owned();
                                     editor.simulation = None;
+                                    editor.brewing.clear();
+                                    editor.brewing_log.clear();
                                     editor.running = false;
                                     editor.inventory_for = None;
                                 }
@@ -1050,6 +1156,24 @@ fn editor_ui(
                             }
                         }
                     });
+                }
+                if let Some(stand) = editor.brewing.get(&pos) {
+                    ui.separator();
+                    ui.strong("Brewing (RedForge extension)");
+                    ui.add(
+                        egui::ProgressBar::new(stand.progress())
+                            .text(format!("残り {} / 400 tick", stand.brew_time)),
+                    );
+                    ui.label(format!(
+                        "燃料 {} / 比較器 {} / 瓶 {:?}",
+                        stand.fuel,
+                        stand.comparator_output(),
+                        stand.bottle_flags()
+                    ));
+                    if stand.observer_pulse {
+                        ui.colored_label(egui::Color32::YELLOW, "Observer pulse");
+                    }
+                    ui.small("比較器値は正確に計算。Nucleation下流への動的伝播は未対応です。");
                 }
             } else {
                 ui.label("セルを選択してください");
@@ -1094,6 +1218,8 @@ fn editor_ui(
                 }
                 if ui.button("Reset").clicked() {
                     editor.simulation = None;
+                    editor.brewing.clear();
+                    editor.brewing_log.clear();
                     editor.running = false;
                     editor.probe_history.clear();
                     editor.scene_epoch = editor.scene_epoch.wrapping_add(1);
@@ -1131,6 +1257,13 @@ fn editor_ui(
                 ui.collapsing("Selected probe", |ui| {
                     for (tick, state) in editor.probe_history.iter().rev().take(8).rev() {
                         ui.small(format!("t{tick}: {}", short_state(state)));
+                    }
+                });
+            }
+            if !editor.brewing_log.is_empty() {
+                ui.collapsing("Brewing events", |ui| {
+                    for event in editor.brewing_log.iter().rev().take(8).rev() {
+                        ui.small(event);
                     }
                 });
             }
@@ -1218,12 +1351,26 @@ fn sync_inventory_editor(editor: &mut Editor) {
                 .iter()
                 .find(|item| usize::from(item.slot) == slot)
                 .cloned()
-                .unwrap_or(InventoryItem {
-                    slot: slot as u8,
-                    id: String::new(),
-                    count: 0,
-                }),
+                .unwrap_or_else(|| InventoryItem::new(slot as u8, "", 0)),
         );
+    }
+}
+
+fn brewing_preset(draft: &mut Vec<InventoryItem>, potion: &str, ingredient: &str) {
+    draft.clear();
+    for slot in 0..3 {
+        draft.push(InventoryItem::new(slot, "minecraft:potion", 1).with_potion(potion));
+    }
+    draft.push(InventoryItem::new(3, ingredient, 1));
+    draft.push(InventoryItem::new(4, "minecraft:blaze_powder", 1));
+}
+
+fn brew_event_label(event: BrewEvent) -> &'static str {
+    match event {
+        BrewEvent::FuelLoaded => "燃料を補充",
+        BrewEvent::Started => "醸造開始",
+        BrewEvent::Cancelled => "材料変更により中断",
+        BrewEvent::Completed => "醸造完了",
     }
 }
 

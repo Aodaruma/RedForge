@@ -52,11 +52,52 @@ enum Transaction {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InventoryItem {
     pub slot: u8,
     pub id: String,
     pub count: u8,
+    pub data: NbtMap,
+}
+
+impl InventoryItem {
+    pub fn new(slot: u8, id: impl Into<String>, count: u8) -> Self {
+        Self {
+            slot,
+            id: id.into(),
+            count,
+            data: NbtMap::new(),
+        }
+    }
+
+    pub fn potion(&self) -> Option<&str> {
+        self.data
+            .get("components")?
+            .as_compound()?
+            .get("minecraft:potion_contents")?
+            .as_compound()?
+            .get("potion")?
+            .as_string()
+            .map(String::as_str)
+    }
+
+    pub fn with_potion(mut self, potion: &str) -> Self {
+        let mut contents = NbtMap::new();
+        contents.insert("potion".to_owned(), NbtValue::String(potion.to_owned()));
+        let mut components = self
+            .data
+            .get("components")
+            .and_then(NbtValue::as_compound)
+            .cloned()
+            .unwrap_or_default();
+        components.insert(
+            "minecraft:potion_contents".to_owned(),
+            NbtValue::Compound(contents),
+        );
+        self.data
+            .insert("components".to_owned(), NbtValue::Compound(components));
+        self
+    }
 }
 
 pub struct Document {
@@ -312,7 +353,16 @@ impl Document {
                     .clone();
                 let slot = nbt_integer(item.get("Slot").or_else(|| item.get("slot"))?)? as u8;
                 let count = nbt_integer(item.get("Count").or_else(|| item.get("count"))?)? as u8;
-                Some(InventoryItem { slot, id, count })
+                let mut data = item.clone();
+                for key in ["id", "Id", "Slot", "slot", "Count", "count"] {
+                    data.remove(key);
+                }
+                Some(InventoryItem {
+                    slot,
+                    id,
+                    count,
+                    data,
+                })
             })
             .collect();
         result.sort_by_key(|item| item.slot);
@@ -365,8 +415,33 @@ impl Document {
         Ok(true)
     }
 
-    pub(crate) fn schematic(&self) -> &UniversalSchematic {
-        &self.schematic
+    pub(crate) fn simulation_schematic(&self) -> UniversalSchematic {
+        let mut schematic = self.schematic.clone();
+        for (pos, state) in self.blocks() {
+            if block_name(&state) == "minecraft:brewing_stand" {
+                schematic.remove_block_entity(pos_tuple(pos));
+            }
+        }
+        schematic
+    }
+
+    pub fn brewing_timers(&self, pos: BlockPos) -> (u16, u8) {
+        let Some(entity) = self.schematic.get_block_entity(block_position(pos)) else {
+            return (0, 0);
+        };
+        let brew_time = entity
+            .nbt
+            .get("BrewTime")
+            .and_then(nbt_integer)
+            .unwrap_or(0)
+            .clamp(0, 400) as u16;
+        let fuel = entity
+            .nbt
+            .get("Fuel")
+            .and_then(nbt_integer)
+            .unwrap_or(0)
+            .clamp(0, 20) as u8;
+        (brew_time, fuel)
     }
 
     pub(crate) fn minimum(&self) -> BlockPos {
@@ -416,10 +491,12 @@ impl Document {
             .schematic
             .get_block_entity_owned(block_position(pos))
             .unwrap_or_else(|| BlockEntity::new(block_name(&block).to_owned(), pos_tuple(pos)));
+        let bottles =
+            [0, 1, 2].map(|slot| items.iter().any(|item| item.slot == slot && item.count > 0));
         let items = items
             .iter()
             .map(|item| {
-                let mut nbt = NbtMap::new();
+                let mut nbt = item.data.clone();
                 nbt.insert("id".to_owned(), NbtValue::String(item.id.clone()));
                 nbt.insert("Count".to_owned(), NbtValue::Byte(item.count as i8));
                 nbt.insert("Slot".to_owned(), NbtValue::Byte(item.slot as i8));
@@ -429,6 +506,15 @@ impl Document {
         entity
             .nbt_mut()
             .insert("Items".to_owned(), NbtValue::List(items));
+        if block_name(&block) == "minecraft:brewing_stand" {
+            let state = format!(
+                "minecraft:brewing_stand[has_bottle_0={},has_bottle_1={},has_bottle_2={}]",
+                bottles[0], bottles[1], bottles[2]
+            );
+            self.schematic
+                .try_set_block_str(pos.x, pos.y, pos.z, &state)
+                .map_err(|error| format!("醸造台stateを更新できません: {error}"))?;
+        }
         self.schematic.set_block_entity(block_position(pos), entity);
         Ok(())
     }
@@ -548,11 +634,7 @@ mod tests {
         document
             .apply_cells([(pos, "minecraft:hopper[enabled=true,facing=down]")])
             .unwrap();
-        let items = vec![InventoryItem {
-            slot: 0,
-            id: "minecraft:redstone".to_owned(),
-            count: 3,
-        }];
+        let items = vec![InventoryItem::new(0, "minecraft:redstone", 3)];
         assert!(document.set_inventory(pos, items.clone()).unwrap());
         assert_eq!(document.inventory(pos), items);
         assert!(document.undo().unwrap());
@@ -568,6 +650,39 @@ mod tests {
         document.save(&path).unwrap();
         let loaded = Document::open(&path).unwrap();
         assert_eq!(loaded.inventory(pos), items);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn brewing_inventory_keeps_potion_data_and_bottle_state() {
+        let mut document = Document::new("brewing");
+        let pos = BlockPos::new(1, 2, 3);
+        document
+            .apply_cells([(
+                pos,
+                "minecraft:brewing_stand[has_bottle_0=false,has_bottle_1=false,has_bottle_2=false]",
+            )])
+            .unwrap();
+        let items = vec![
+            InventoryItem::new(0, "minecraft:potion", 1).with_potion("minecraft:water"),
+            InventoryItem::new(3, "minecraft:nether_wart", 1),
+        ];
+        document.set_inventory(pos, items.clone()).unwrap();
+        assert!(document.block(pos).contains("has_bottle_0=true"));
+        assert_eq!(document.inventory(pos), items);
+        assert!(document.undo().unwrap());
+        assert!(document.block(pos).contains("has_bottle_0=false"));
+
+        document.redo().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "redforge-brewing-{}-{}.litematic",
+            std::process::id(),
+            document.revision
+        ));
+        document.save(&path).unwrap();
+        let loaded = Document::open(&path).unwrap();
+        assert_eq!(loaded.inventory(pos), items);
+        assert!(loaded.block(pos).contains("has_bottle_0=true"));
         fs::remove_file(path).unwrap();
     }
 }

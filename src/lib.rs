@@ -1,4 +1,5 @@
 pub mod app;
+pub mod brewing;
 pub mod document;
 pub mod simulation;
 
