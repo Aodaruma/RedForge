@@ -6,7 +6,9 @@ Minecraft Java Edition向けの、ローカル動作するレッドストーン�
 
 ## 現在できること
 
-- 同一3DシーンのTop / Isometric / Orbit表示、active Y layer編集
+- Minecraftクライアントの実textureを使ったTop / Isometric / Orbit表示、active Y layer編集
+- 32×32のflat-world床、1 block単位のgrid、影のないunlit表示
+- Minecraft inventory icon / 代表textureのPalette grid、hover時のblock名表示
 - blockの直線drag配置・削除、box選択、copy / paste、undo / redo
 - redstone wire、torch、repeater、comparator、lamp、lever、button、Observer、Piston等のtick実行
 - hopper、barrel、dispenser、dropperのinventory編集
@@ -27,6 +29,8 @@ cargo run --release
 
 初回だけRust toolchainとGit依存関係の取得、releaseビルドに時間がかかります。開発中は`cargo run`でも起動できます。
 
+Minecraftの見た目は、端末に導入済みのJava Edition client JARから起動時に読み込みます。公式Launcher、Prism Launcher、MultiMCを自動検出し、読み込めない場合は簡易色にfallbackします。任意のJARを指定する場合は、起動前に`REDFORGE_MINECRAFT_JAR`を設定してください。
+
 ## 基本操作
 
 | 操作 | 入力 |
@@ -36,7 +40,9 @@ cargo run --release
 | 削除 / 連続削除 | 右click / drag |
 | pan / Orbit回転 | middle drag |
 | zoom | wheel |
-| カメラ切替 | 上部Top / Isometric / Orbit、または`1` / `2` / `3` |
+| 新規 / 開く / 保存 | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` |
+| 名前を付けて保存 | `Ctrl+Shift+S` |
+| カメラ切替 | View menu、または`1` / `2` / `3` |
 | カメラ90°回転 | `Q` / `E` |
 | Y layer移動 | `[` / `]` |
 | 配置blockの向き回転 | `R` |
@@ -49,7 +55,7 @@ cargo run --release
 | simulation start / run / pause | Inspectorのボタン、または`Space` |
 | 1 tick step | InspectorのStep、または`.` |
 
-ファイルを開く場合は、上部のpath欄へ`.litematic`のpathを入力して`Open`を押します。保存先も同じ欄で指定します。
+すべての編集・カメラ・simulation操作はWindowsのFile / Edit / View / Simulation menuからも実行できます。開く・保存はWindows標準ダイアログで`.litematic`を選びます。
 
 ## 醸造台を使う
 
@@ -67,7 +73,8 @@ cargo run --release
 - water flow / waterlogged形状にはNucleation由来の近似があります。
 - farmland / wheatは表示・保存のみで、random tickや成長は実行しません。モブAIも対象外です。
 - `.litematic`編集はsingle-region限定です。multi-regionは黙って統合せず、読込を拒否します。
-- Minecraftのmodel / textureは同梱せず、独自の簡略Technical Themeで表示します。
+- Minecraft資産は同梱・再配布せず、導入済みclient JARからメモリ上に読み込みます。block modelから動的生成されるinventory iconは完成PNGがないため、現時点では実block textureの代表面を表示します。
+- 複雑なblock modelは保存・simulation用のBlockStateを維持しつつ、viewportでは実texture付きの簡略形状で表示します。
 - simulation結果は設計へ書き戻しません。編集を始めるとsimulation snapshotを破棄します。
 
 ## 開発時の確認
