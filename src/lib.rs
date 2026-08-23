@@ -1,6 +1,8 @@
 pub mod app;
 pub mod brewing;
 pub mod document;
+pub mod minecraft_assets;
+pub mod native_menu;
 pub mod simulation;
 
 pub const APP_NAME: &str = "RedForge";

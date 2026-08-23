@@ -10,9 +10,16 @@ license = "MIT"
 bevy = { version = "=0.19.1", default-features = false, features = ["std", "bevy_winit", "bevy_pbr", "multi_threaded"] }
 bevy_egui = { version = "=0.42.0", default-features = false, features = ["default_fonts", "render"] }
 diplomat-runtime = "0.15"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
 nucleation = { git = "https://github.com/Schem-at/Nucleation.git", rev = "04a4753fe73167888eb6372fd23678d818d22b56", default-features = false, features = ["bridge", "mc-tick"] }
+rfd = { version = "=0.17.2", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+muda = { version = "=0.19.3", default-features = false }
+raw-window-handle = "=0.6.2"
 
 [profile.dev]
 opt-level = 1
