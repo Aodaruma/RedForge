@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     f32::consts::FRAC_PI_2,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -9,12 +9,13 @@ use bevy::{
     app::AppExit,
     camera::ScalingMode,
     core_pipeline::tonemapping::Tonemapping,
+    image::ImageSampler,
     input::mouse::{AccumulatedMouseMotion, MouseWheel},
     prelude::*,
-    window::{WindowCloseRequested, WindowResolution},
+    window::{PrimaryWindow, WindowCloseRequested, WindowResolution},
 };
 use bevy_egui::{
-    EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui,
+    EguiContexts, EguiPlugin, EguiPrimaryContextPass, EguiTextureHandle, egui,
     input::{egui_wants_any_keyboard_input, egui_wants_any_pointer_input},
 };
 
@@ -22,6 +23,8 @@ use crate::{
     APP_NAME,
     brewing::{BrewEvent, BrewingStand},
     document::{BlockPos, Document, InventoryItem, rotate_state_y},
+    minecraft_assets::{BlockFace, MinecraftAssets, block_textures},
+    native_menu::{MenuAction, NativeMenuPlugin},
     simulation::{RedstoneSimulation, SettleMode},
 };
 
@@ -158,20 +161,16 @@ struct Editor {
     ticks_per_second: f32,
     tick_accumulator: f32,
     probe_history: Vec<(u32, String)>,
-    file_path: String,
     message: String,
     scene_epoch: u64,
     confirm_discard: bool,
+    pending_file_action: Option<FileAction>,
     confirm_close: bool,
 }
 
 impl Editor {
     fn replace_document(&mut self, document: Document) {
         self.active_layer = document.minimum().y;
-        self.file_path = document
-            .path()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "design.litematic".to_owned());
         self.document = document;
         self.simulation = None;
         self.running = false;
@@ -185,7 +184,14 @@ impl Editor {
         self.brewing_log.clear();
         self.scene_epoch = self.scene_epoch.wrapping_add(1);
         self.confirm_discard = false;
+        self.pending_file_action = None;
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileAction {
+    New,
+    Open,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -252,6 +258,20 @@ struct AutosaveState {
     quiet_seconds: f32,
 }
 
+#[derive(Resource, Default)]
+struct MinecraftVisuals {
+    palette_icons: Vec<Option<Handle<Image>>>,
+    textures: BTreeMap<&'static str, Handle<Image>>,
+    source: String,
+}
+
+impl MinecraftVisuals {
+    fn texture_for(&self, state: &str) -> Option<Handle<Image>> {
+        let path = block_textures(state)?.for_face(BlockFace::Top);
+        self.textures.get(path).cloned()
+    }
+}
+
 pub fn run() {
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.035, 0.045, 0.06)))
@@ -276,10 +296,10 @@ pub fn run() {
             ticks_per_second: 20.0,
             tick_accumulator: 0.0,
             probe_history: Vec::new(),
-            file_path: "design.litematic".to_owned(),
             message: "Gate 0 fixtureを読み込みました".to_owned(),
             scene_epoch: 0,
             confirm_discard: false,
+            pending_file_action: None,
             confirm_close: false,
         })
         .insert_resource(CameraRig {
@@ -292,6 +312,7 @@ pub fn run() {
         .init_resource::<CursorCell>()
         .init_resource::<ViewportBounds>()
         .init_resource::<PaintDrag>()
+        .init_resource::<MinecraftVisuals>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: format!("{APP_NAME} — Technical Preview"),
@@ -301,9 +322,13 @@ pub fn run() {
             close_when_requested: false,
             ..default()
         }))
-        .add_plugins(EguiPlugin::default())
-        .add_systems(Startup, setup)
+        .add_plugins((EguiPlugin::default(), NativeMenuPlugin))
+        .add_systems(Startup, (load_minecraft_visuals, setup).chain())
         .add_systems(Update, sync_scene)
+        .add_systems(
+            Update,
+            (handle_menu_actions, file_shortcuts, update_window_title),
+        )
         .add_systems(
             Update,
             (camera_keys, editor_keys).run_if(not(egui_wants_any_keyboard_input)),
@@ -320,31 +345,150 @@ pub fn run() {
         .run();
 }
 
+fn load_minecraft_visuals(
+    mut visuals: ResMut<MinecraftVisuals>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let source = match MinecraftAssets::discover() {
+        Ok(source) => source,
+        Err(error) => {
+            visuals.source = format!("Minecraft textures unavailable: {error}");
+            visuals.palette_icons.resize(PALETTE.len(), None);
+            return;
+        }
+    };
+
+    visuals.source = format!("Minecraft {} · local assets", source.version());
+    for item in PALETTE {
+        let handle = source.load_palette_texture(item.state).ok().map(|texture| {
+            if let Some(handle) = visuals.textures.get(texture.source_path) {
+                return handle.clone();
+            }
+            let mut image = texture.image.into_bevy_image();
+            image.sampler = ImageSampler::nearest();
+            let handle = images.add(image);
+            visuals.textures.insert(texture.source_path, handle.clone());
+            handle
+        });
+        visuals.palette_icons.push(handle);
+    }
+
+    let dynamic_states = [
+        "minecraft:redstone_lamp[lit=true]",
+        "minecraft:repeater[powered=true]",
+        "minecraft:comparator[powered=true]",
+        "minecraft:observer[powered=true]",
+        "minecraft:farmland[moisture=0]",
+    ];
+    for state in PALETTE.iter().map(|item| item.state).chain(dynamic_states) {
+        let Some(textures) = block_textures(state) else {
+            continue;
+        };
+        for face in [
+            BlockFace::Top,
+            BlockFace::Bottom,
+            BlockFace::Side,
+            BlockFace::Front,
+            BlockFace::Back,
+        ] {
+            let path = textures.for_face(face);
+            if visuals.textures.contains_key(path) {
+                continue;
+            }
+            if let Ok(texture) = source.load_png(path) {
+                let mut image = texture.first_frame().into_bevy_image();
+                image.sampler = ImageSampler::nearest();
+                visuals.textures.insert(path, images.add(image));
+            }
+        }
+    }
+    let grass = "assets/minecraft/textures/block/grass_block_top.png";
+    if !visuals.textures.contains_key(grass)
+        && let Ok(texture) = source.load_png(grass)
+    {
+        let mut image = texture.into_bevy_image();
+        image.sampler = ImageSampler::nearest();
+        visuals.textures.insert(grass, images.add(image));
+    }
+}
+
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    visuals: Res<MinecraftVisuals>,
 ) {
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 6_000.0,
-            shadow_maps_enabled: true,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.7, 0.0)),
-    ));
     commands.spawn((
         Camera3d::default(),
         Tonemapping::None,
         Projection::Orthographic(OrthographicProjection {
             scaling_mode: ScalingMode::FixedVertical {
-                viewport_height: 12.0,
+                viewport_height: 18.0,
             },
             ..OrthographicProjection::default_3d()
         }),
         Transform::from_xyz(8.0, 9.0, 10.0).looking_at(Vec3::new(1.0, 0.0, 0.0), Vec3::Y),
         MainCamera,
     ));
+    let ground_material = materials.add(StandardMaterial {
+        base_color: if visuals
+            .textures
+            .contains_key("assets/minecraft/textures/block/grass_block_top.png")
+        {
+            // Minecraft's grass texture expects a biome tint in the renderer.
+            Color::srgb(0.48, 0.75, 0.35)
+        } else {
+            Color::srgb(0.22, 0.34, 0.19)
+        },
+        base_color_texture: visuals
+            .textures
+            .get("assets/minecraft/textures/block/grass_block_top.png")
+            .cloned(),
+        unlit: true,
+        ..default()
+    });
+    let ground_tile = meshes.add(Cuboid::new(1.0, 0.04, 1.0));
+    for x in -16..16 {
+        for z in -16..16 {
+            commands.spawn((
+                Mesh3d(ground_tile.clone()),
+                MeshMaterial3d(ground_material.clone()),
+                Transform::from_xyz(x as f32, 0.475, z as f32),
+            ));
+        }
+    }
+    let minor_grid = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.055, 0.065, 0.075, 0.72),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+    let major_grid = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.42, 0.66, 0.75, 0.88),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+    let x_line = meshes.add(Cuboid::new(32.0, 0.012, 0.018));
+    let z_line = meshes.add(Cuboid::new(0.018, 0.012, 32.0));
+    for index in -16..=16 {
+        let coordinate = index as f32 - 0.5;
+        let material = if index % 4 == 0 {
+            major_grid.clone()
+        } else {
+            minor_grid.clone()
+        };
+        commands.spawn((
+            Mesh3d(x_line.clone()),
+            MeshMaterial3d(material.clone()),
+            Transform::from_xyz(-0.5, 0.502, coordinate),
+        ));
+        commands.spawn((
+            Mesh3d(z_line.clone()),
+            MeshMaterial3d(material),
+            Transform::from_xyz(coordinate, 0.502, -0.5),
+        ));
+    }
     let preview_mesh = meshes.add(Cuboid::new(0.98, 0.98, 0.98));
     commands.spawn((
         Mesh3d(preview_mesh.clone()),
@@ -373,8 +517,9 @@ fn setup(
 fn sync_scene(
     mut commands: Commands,
     editor: Res<Editor>,
+    minecraft_visuals: Res<MinecraftVisuals>,
     mut rendered: ResMut<RenderedRevision>,
-    visuals: Query<Entity, With<SceneVisual>>,
+    scene_visuals: Query<Entity, With<SceneVisual>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -387,7 +532,7 @@ fn sync_scene(
     if rendered.0 == Some(signature) {
         return;
     }
-    for entity in &visuals {
+    for entity in &scene_visuals {
         commands.entity(entity).despawn();
     }
     let mut positions: BTreeSet<_> = editor
@@ -430,20 +575,33 @@ fn sync_scene(
         } else {
             block_color(&state)
         };
+        let texture = minecraft_visuals.texture_for(&state);
         commands.spawn((
             Mesh3d(meshes.add(Cuboid::new(size.x, size.y, size.z))),
             MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: if selected {
+                base_color: if selected && texture.is_some() {
+                    Color::srgb(0.72, 0.98, 1.0)
+                } else if texture.is_some() {
+                    Color::WHITE
+                } else if selected {
                     Color::srgb(0.12, 0.82, 0.92)
                 } else {
                     color
                 },
+                base_color_texture: texture,
                 alpha_mode: if state.starts_with("minecraft:water") {
                     AlphaMode::Blend
+                } else if state.contains("wheat")
+                    || state.contains("torch")
+                    || state.contains("redstone_wire")
+                    || state.contains("lever")
+                {
+                    AlphaMode::Mask(0.5)
                 } else {
                     AlphaMode::Opaque
                 },
                 perceptual_roughness: 0.72,
+                unlit: true,
                 ..default()
             })),
             Transform::from_translation(
@@ -454,7 +612,11 @@ fn sync_scene(
         if let Some((rotation, direction)) = facing_marker(&state) {
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(0.12, 0.1, 0.62))),
-                MeshMaterial3d(materials.add(Color::srgb(0.98, 0.82, 0.16))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.98, 0.82, 0.16),
+                    unlit: true,
+                    ..default()
+                })),
                 Transform {
                     translation: block_vec3(pos) + Vec3::Y * 0.53 + direction * 0.18,
                     rotation,
@@ -469,7 +631,11 @@ fn sync_scene(
             let height = 0.1 + power as f32 / 15.0 * 0.65;
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(0.12, height, 0.12))),
-                MeshMaterial3d(materials.add(Color::srgb(1.0, 0.25, 0.05))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(1.0, 0.25, 0.05),
+                    unlit: true,
+                    ..default()
+                })),
                 Transform::from_translation(block_vec3(pos) + Vec3::new(0.34, height * 0.5, 0.34)),
                 SceneVisual,
             ));
@@ -479,7 +645,11 @@ fn sync_scene(
             let height = 0.08 + f32::from(output) / 15.0 * 0.62;
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(0.1, height, 0.1))),
-                MeshMaterial3d(materials.add(Color::srgb(0.78, 0.18, 0.92))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.78, 0.18, 0.92),
+                    unlit: true,
+                    ..default()
+                })),
                 Transform::from_translation(block_vec3(pos) + Vec3::new(-0.35, height * 0.5, 0.35)),
                 SceneVisual,
             ));
@@ -646,6 +816,200 @@ fn add_line(cells: &mut BTreeSet<BlockPos>, from: BlockPos, to: BlockPos) {
     }
 }
 
+fn invalidate_simulation(editor: &mut Editor) {
+    editor.simulation = None;
+    editor.brewing.clear();
+    editor.brewing_log.clear();
+    editor.running = false;
+}
+
+fn undo_redo(editor: &mut Editor, redo: bool) {
+    let result = if redo {
+        editor.document.redo()
+    } else {
+        editor.document.undo()
+    };
+    if let Err(error) = result {
+        editor.message = error;
+    }
+    invalidate_simulation(editor);
+}
+
+fn rotate_paint(editor: &mut Editor) {
+    match rotate_state_y(&editor.paint_state) {
+        Ok(state) => editor.paint_state = state,
+        Err(error) => editor.message = error,
+    }
+}
+
+fn copy_selection(editor: &mut Editor) {
+    let Some((a, b)) = editor.selection else {
+        editor.message = "選択範囲がありません".to_owned();
+        return;
+    };
+    let origin = BlockPos::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z));
+    editor.clipboard = editor
+        .document
+        .selected_blocks(a, b)
+        .into_iter()
+        .map(|(pos, state)| {
+            (
+                BlockPos::new(pos.x - origin.x, pos.y - origin.y, pos.z - origin.z),
+                state,
+            )
+        })
+        .collect();
+    editor.message = format!("{} blocksをcopyしました", editor.clipboard.len());
+}
+
+fn paste_clipboard(editor: &mut Editor, origin: Option<BlockPos>) {
+    let Some(origin) = origin else {
+        editor.message = "paste先のセルを指してください".to_owned();
+        return;
+    };
+    let cells: Vec<_> = editor
+        .clipboard
+        .iter()
+        .map(|(offset, state)| {
+            (
+                BlockPos::new(
+                    origin.x + offset.x,
+                    origin.y + offset.y,
+                    origin.z + offset.z,
+                ),
+                state.clone(),
+            )
+        })
+        .collect();
+    match editor.document.apply_cells(cells) {
+        Ok(count) => editor.message = format!("{count} blocksをpasteしました"),
+        Err(error) => editor.message = error,
+    }
+}
+
+fn delete_selection(editor: &mut Editor) {
+    let Some((a, b)) = editor.selection else {
+        editor.message = "選択範囲がありません".to_owned();
+        return;
+    };
+    let cells: Vec<_> = editor
+        .document
+        .selected_blocks(a, b)
+        .into_iter()
+        .map(|(pos, _)| (pos, AIR))
+        .collect();
+    match editor.document.apply_cells(cells) {
+        Ok(count) => editor.message = format!("{count} blocksを削除しました"),
+        Err(error) => editor.message = error,
+    }
+}
+
+fn focus_selection(editor: &Editor, rig: &mut CameraRig) {
+    let focus = editor
+        .selection
+        .map(|(a, b)| {
+            Vec3::new(
+                (a.x + b.x) as f32 * 0.5,
+                (a.y + b.y) as f32 * 0.5,
+                (a.z + b.z) as f32 * 0.5,
+            )
+        })
+        .or_else(|| editor.selected.map(block_vec3));
+    if let Some(focus) = focus {
+        rig.target = focus;
+    }
+}
+
+fn use_selected(editor: &mut Editor) {
+    let (Some(pos), Some(simulation)) = (editor.selected, editor.simulation.as_mut()) else {
+        editor.message = "simulationと操作対象を選んでください".to_owned();
+        return;
+    };
+    simulation.use_block(pos);
+    editor.scene_epoch = editor.scene_epoch.wrapping_add(1);
+    record_probe(editor);
+}
+
+fn toggle_simulation(editor: &mut Editor) {
+    if editor.simulation.is_none() {
+        start_simulation(editor);
+    } else {
+        editor.running = !editor.running;
+        editor.message = if editor.running {
+            "simulationを実行中".to_owned()
+        } else {
+            "simulationをpauseしました".to_owned()
+        };
+    }
+}
+
+fn reset_simulation(editor: &mut Editor) {
+    invalidate_simulation(editor);
+    editor.probe_history.clear();
+    editor.scene_epoch = editor.scene_epoch.wrapping_add(1);
+}
+
+fn handle_menu_actions(
+    mut actions: MessageReader<MenuAction>,
+    cursor: Res<CursorCell>,
+    mut editor: ResMut<Editor>,
+    mut rig: ResMut<CameraRig>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    for action in actions.read().copied() {
+        match action {
+            MenuAction::New => request_file_action(&mut editor, FileAction::New),
+            MenuAction::Open => request_file_action(&mut editor, FileAction::Open),
+            MenuAction::Save => save_document(&mut editor),
+            MenuAction::SaveAs => save_document_as(&mut editor),
+            MenuAction::Exit if editor.document.dirty => editor.confirm_close = true,
+            MenuAction::Exit => {
+                exit.write(AppExit::Success);
+            }
+            MenuAction::Undo => undo_redo(&mut editor, false),
+            MenuAction::Redo => undo_redo(&mut editor, true),
+            MenuAction::Copy => copy_selection(&mut editor),
+            MenuAction::Paste => paste_clipboard(&mut editor, cursor.0),
+            MenuAction::Delete => delete_selection(&mut editor),
+            MenuAction::Rotate => rotate_paint(&mut editor),
+            MenuAction::Paint => editor.tool = Tool::Paint,
+            MenuAction::Select => editor.tool = Tool::Select,
+            MenuAction::Top => editor.camera = CameraPreset::Top,
+            MenuAction::Isometric => editor.camera = CameraPreset::Isometric,
+            MenuAction::Orbit => editor.camera = CameraPreset::Orbit,
+            MenuAction::LayerDown => editor.active_layer -= 1,
+            MenuAction::LayerUp => editor.active_layer += 1,
+            MenuAction::Focus => focus_selection(&editor, &mut rig),
+            MenuAction::Start => start_simulation(&mut editor),
+            MenuAction::Use => use_selected(&mut editor),
+            MenuAction::Step => step_simulation(&mut editor, 1),
+            MenuAction::RunPause => toggle_simulation(&mut editor),
+            MenuAction::Reset => reset_simulation(&mut editor),
+        }
+    }
+}
+
+fn file_shortcuts(keys: Res<ButtonInput<KeyCode>>, mut editor: ResMut<Editor>) {
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    if !ctrl {
+        return;
+    }
+    if keys.just_pressed(KeyCode::KeyN) {
+        request_file_action(&mut editor, FileAction::New);
+    }
+    if keys.just_pressed(KeyCode::KeyO) {
+        request_file_action(&mut editor, FileAction::Open);
+    }
+    if keys.just_pressed(KeyCode::KeyS) {
+        let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+        if shift {
+            save_document_as(&mut editor);
+        } else {
+            save_document(&mut editor);
+        }
+    }
+}
+
 fn editor_keys(
     keys: Res<ButtonInput<KeyCode>>,
     cursor: Res<CursorCell>,
@@ -668,109 +1032,29 @@ fn editor_keys(
         editor.active_layer += 1;
     }
     if keys.just_pressed(KeyCode::KeyR) {
-        match rotate_state_y(&editor.paint_state) {
-            Ok(state) => editor.paint_state = state,
-            Err(error) => editor.message = error,
-        }
+        rotate_paint(&mut editor);
     }
     if ctrl && keys.just_pressed(KeyCode::KeyZ) {
-        let result = if shift {
-            editor.document.redo()
-        } else {
-            editor.document.undo()
-        };
-        if let Err(error) = result {
-            editor.message = error;
-        }
-        editor.simulation = None;
-        editor.brewing.clear();
-        editor.brewing_log.clear();
+        undo_redo(&mut editor, shift);
     }
-    if ctrl
-        && keys.just_pressed(KeyCode::KeyC)
-        && let Some((a, b)) = editor.selection
-    {
-        let origin = BlockPos::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z));
-        editor.clipboard = editor
-            .document
-            .selected_blocks(a, b)
-            .into_iter()
-            .map(|(pos, state)| {
-                (
-                    BlockPos::new(pos.x - origin.x, pos.y - origin.y, pos.z - origin.z),
-                    state,
-                )
-            })
-            .collect();
-        editor.message = format!("{} blocksをcopyしました", editor.clipboard.len());
+    if ctrl && keys.just_pressed(KeyCode::KeyC) {
+        copy_selection(&mut editor);
     }
-    if ctrl
-        && keys.just_pressed(KeyCode::KeyV)
-        && let Some(origin) = cursor.0
-    {
-        let cells: Vec<_> = editor
-            .clipboard
-            .iter()
-            .map(|(offset, state)| {
-                (
-                    BlockPos::new(
-                        origin.x + offset.x,
-                        origin.y + offset.y,
-                        origin.z + offset.z,
-                    ),
-                    state.clone(),
-                )
-            })
-            .collect();
-        match editor.document.apply_cells(cells) {
-            Ok(count) => editor.message = format!("{count} blocksをpasteしました"),
-            Err(error) => editor.message = error,
-        }
+    if ctrl && keys.just_pressed(KeyCode::KeyV) {
+        paste_clipboard(&mut editor, cursor.0);
     }
-    if keys.just_pressed(KeyCode::Delete)
-        && let Some((a, b)) = editor.selection
-    {
-        let cells: Vec<_> = editor
-            .document
-            .selected_blocks(a, b)
-            .into_iter()
-            .map(|(pos, _)| (pos, AIR))
-            .collect();
-        match editor.document.apply_cells(cells) {
-            Ok(count) => editor.message = format!("{count} blocksを削除しました"),
-            Err(error) => editor.message = error,
-        }
+    if keys.just_pressed(KeyCode::Delete) {
+        delete_selection(&mut editor);
     }
     if keys.just_pressed(KeyCode::Escape) {
         editor.selection = None;
         editor.selection_anchor = None;
     }
     if keys.just_pressed(KeyCode::KeyF) {
-        let focus = editor
-            .selection
-            .map(|(a, b)| {
-                Vec3::new(
-                    (a.x + b.x) as f32 * 0.5,
-                    (a.y + b.y) as f32 * 0.5,
-                    (a.z + b.z) as f32 * 0.5,
-                )
-            })
-            .or_else(|| editor.selected.map(block_vec3));
-        if let Some(focus) = focus {
-            rig.target = focus;
-        }
+        focus_selection(&editor, &mut rig);
     }
     if keys.just_pressed(KeyCode::Space) {
-        if editor.simulation.is_none() {
-            start_simulation(&mut editor);
-        } else {
-            editor.running = !editor.running;
-            editor.message = if editor.running {
-                "simulationを実行中".to_owned()
-            } else {
-                "simulationをpauseしました".to_owned()
-            };
-        }
+        toggle_simulation(&mut editor);
     }
     if keys.just_pressed(KeyCode::Period) {
         step_simulation(&mut editor, 1);
@@ -952,6 +1236,25 @@ fn close_request(
     }
 }
 
+fn update_window_title(editor: Res<Editor>, mut windows: Query<&mut Window, With<PrimaryWindow>>) {
+    if !editor.is_changed() {
+        return;
+    }
+    let Ok(mut window) = windows.single_mut() else {
+        return;
+    };
+    let name = editor
+        .document
+        .path()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("Untitled");
+    window.title = format!(
+        "{name}{} — {APP_NAME}",
+        if editor.document.dirty { " *" } else { "" }
+    );
+}
+
 fn autosave(time: Res<Time>, mut editor: ResMut<Editor>, mut state: Local<AutosaveState>) {
     if !editor.document.dirty {
         state.revision = editor.document.revision;
@@ -986,10 +1289,20 @@ fn recovery_path() -> PathBuf {
 fn editor_ui(
     mut contexts: EguiContexts,
     mut editor: ResMut<Editor>,
+    visuals: Res<MinecraftVisuals>,
     mut viewport_bounds: ResMut<ViewportBounds>,
     mut exit: MessageWriter<AppExit>,
     mut fonts_configured: Local<bool>,
 ) -> Result {
+    let palette_textures: Vec<_> = visuals
+        .palette_icons
+        .iter()
+        .map(|handle| {
+            handle
+                .as_ref()
+                .map(|handle| contexts.add_image(EguiTextureHandle::Strong(handle.clone())))
+        })
+        .collect();
     let ctx = contexts.ctx_mut()?;
     if !*fonts_configured {
         configure_fonts(ctx);
@@ -1003,311 +1316,279 @@ fn editor_ui(
             .layer_id(egui::LayerId::background())
             .max_rect(ctx.viewport_rect()),
     );
-    egui::Panel::top("toolbar").show(&mut root, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.heading(APP_NAME);
-            if editor.document.dirty {
-                ui.label("● unsaved");
-            }
-            ui.separator();
-            if ui.button("New").clicked() {
-                if editor.document.dirty {
-                    editor.confirm_discard = true;
-                } else {
-                    editor.replace_document(Document::default());
-                }
-            }
-            ui.add(egui::TextEdit::singleline(&mut editor.file_path).desired_width(230.0));
-            if ui.button("Open").clicked() {
-                if editor.document.dirty {
-                    editor.confirm_discard = true;
-                } else {
-                    open_document(&mut editor);
-                }
-            }
-            if ui.button("Save").clicked() {
-                save_document(&mut editor);
-            }
-            ui.separator();
-            if ui
-                .add_enabled(editor.document.can_undo(), egui::Button::new("Undo"))
-                .clicked()
-            {
-                if let Err(error) = editor.document.undo() {
-                    editor.message = error;
-                }
-                editor.simulation = None;
-                editor.brewing.clear();
-                editor.brewing_log.clear();
-            }
-            if ui
-                .add_enabled(editor.document.can_redo(), egui::Button::new("Redo"))
-                .clicked()
-            {
-                if let Err(error) = editor.document.redo() {
-                    editor.message = error;
-                }
-                editor.simulation = None;
-                editor.brewing.clear();
-                editor.brewing_log.clear();
-            }
-            ui.separator();
-            ui.selectable_value(&mut editor.camera, CameraPreset::Top, "Top");
-            ui.selectable_value(&mut editor.camera, CameraPreset::Isometric, "Isometric");
-            ui.selectable_value(&mut editor.camera, CameraPreset::Orbit, "Orbit");
-            ui.separator();
-            if ui.button("[").clicked() {
-                editor.active_layer -= 1;
-            }
-            ui.label(format!("Y {}", editor.active_layer));
-            if ui.button("]").clicked() {
-                editor.active_layer += 1;
-            }
-        });
-    });
     egui::Panel::left("palette")
         .resizable(false)
+        .default_size(232.0)
+        .frame(egui::Frame::side_top_panel(&ctx.style_of(egui::Theme::Dark)).inner_margin(12.0))
         .show(&mut root, |ui| {
             ui.heading("Palette");
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut editor.tool, Tool::Paint, "Paint");
                 ui.selectable_value(&mut editor.tool, Tool::Select, "Select (V)");
             });
+            ui.add_space(4.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for (index, item) in PALETTE.iter().enumerate() {
-                    if ui
-                        .selectable_label(editor.palette_index == index, item.label)
-                        .clicked()
-                    {
-                        editor.palette_index = index;
-                        editor.paint_state = item.state.to_owned();
-                        editor.tool = Tool::Paint;
-                    }
-                }
+                egui::Grid::new("palette-icon-grid")
+                    .num_columns(4)
+                    .spacing(egui::vec2(6.0, 6.0))
+                    .show(ui, |ui| {
+                        for (index, item) in PALETTE.iter().enumerate() {
+                            let selected = editor.palette_index == index;
+                            let response = if let Some(texture) = palette_textures[index] {
+                                let image = egui::Image::new((texture, egui::vec2(34.0, 34.0)))
+                                    .texture_options(egui::TextureOptions::NEAREST);
+                                ui.add(
+                                    egui::Button::image(image)
+                                        .selected(selected)
+                                        .min_size(egui::vec2(46.0, 46.0)),
+                                )
+                            } else {
+                                ui.add(
+                                    egui::Button::new(short_palette_label(item.label))
+                                        .selected(selected)
+                                        .min_size(egui::vec2(46.0, 46.0)),
+                                )
+                            }
+                            .on_hover_text(format!("{}\n{}", item.label, item.state));
+                            if response.clicked() {
+                                editor.palette_index = index;
+                                editor.paint_state = item.state.to_owned();
+                                editor.tool = Tool::Paint;
+                            }
+                            if (index + 1) % 4 == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
             });
             ui.separator();
+            ui.strong(PALETTE[editor.palette_index].label);
+            ui.small(&visuals.source);
             ui.label("R: facingを90°回転");
             ui.small("左drag: 配置 / 右drag: 削除");
         });
     egui::Panel::right("inspector")
         .resizable(true)
+        .default_size(320.0)
+        .frame(egui::Frame::side_top_panel(&ctx.style_of(egui::Theme::Dark)).inner_margin(12.0))
         .show(&mut root, |ui| {
-            ui.heading("Inspector");
-            if let Some(pos) = editor.selected {
-                ui.monospace(format!("x={} y={} z={}", pos.x, pos.y, pos.z));
-                let state = if editor.brewing.contains_key(&pos) {
-                    editor.document.block(pos)
-                } else {
-                    editor
-                        .simulation
-                        .as_ref()
-                        .map(|simulation| simulation.block(pos))
-                        .unwrap_or_else(|| editor.document.block(pos))
-                };
-                ui.monospace(state);
-                if editor.document.inventory_slot_count(pos).is_some() {
-                    ui.collapsing("Inventory", |ui| {
-                        if editor
-                            .document
-                            .block(pos)
-                            .starts_with("minecraft:brewing_stand")
-                        {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Preset:");
-                                if ui.button("水→奇妙").clicked() {
-                                    brewing_preset(
-                                        &mut editor.inventory_draft,
-                                        "minecraft:water",
-                                        "minecraft:nether_wart",
-                                    );
-                                }
-                                if ui.button("奇妙→俊敏").clicked() {
-                                    brewing_preset(
-                                        &mut editor.inventory_draft,
-                                        "minecraft:awkward",
-                                        "minecraft:sugar",
-                                    );
-                                }
-                                if ui.button("俊敏→延長").clicked() {
-                                    brewing_preset(
-                                        &mut editor.inventory_draft,
-                                        "minecraft:swiftness",
-                                        "minecraft:redstone",
-                                    );
-                                }
-                            });
-                        }
-                        egui::ScrollArea::vertical()
-                            .max_height(220.0)
-                            .show(ui, |ui| {
-                                for item in &mut editor.inventory_draft {
-                                    ui.horizontal(|ui| {
-                                        ui.label(format!("{}", item.slot));
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut item.id)
-                                                .desired_width(145.0),
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.heading("Inspector");
+                if let Some(pos) = editor.selected {
+                    ui.monospace(format!("x={} y={} z={}", pos.x, pos.y, pos.z));
+                    let state = if editor.brewing.contains_key(&pos) {
+                        editor.document.block(pos)
+                    } else {
+                        editor
+                            .simulation
+                            .as_ref()
+                            .map(|simulation| simulation.block(pos))
+                            .unwrap_or_else(|| editor.document.block(pos))
+                    };
+                    ui.monospace(state);
+                    if editor.document.inventory_slot_count(pos).is_some() {
+                        ui.collapsing("Inventory", |ui| {
+                            if editor
+                                .document
+                                .block(pos)
+                                .starts_with("minecraft:brewing_stand")
+                            {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Preset:");
+                                    if ui.button("水→奇妙").clicked() {
+                                        brewing_preset(
+                                            &mut editor.inventory_draft,
+                                            "minecraft:water",
+                                            "minecraft:nether_wart",
                                         );
-                                        ui.add(egui::DragValue::new(&mut item.count).range(0..=64));
-                                    });
-                                    if let Some(potion) = item.potion() {
-                                        ui.small(format!("  potion: {potion}"));
                                     }
-                                }
-                            });
-                        if ui.button("Inventoryを適用").clicked() {
-                            let items: Vec<_> = editor
-                                .inventory_draft
-                                .iter()
-                                .filter(|item| !item.id.trim().is_empty() && item.count > 0)
-                                .cloned()
-                                .collect();
-                            match editor.document.set_inventory(pos, items) {
-                                Ok(true) => {
-                                    editor.message = "Inventoryを更新しました".to_owned();
-                                    editor.simulation = None;
-                                    editor.brewing.clear();
-                                    editor.brewing_log.clear();
-                                    editor.running = false;
-                                    editor.inventory_for = None;
-                                }
-                                Ok(false) => editor.message = "Inventoryは変更なしです".to_owned(),
-                                Err(error) => editor.message = error,
+                                    if ui.button("奇妙→俊敏").clicked() {
+                                        brewing_preset(
+                                            &mut editor.inventory_draft,
+                                            "minecraft:awkward",
+                                            "minecraft:sugar",
+                                        );
+                                    }
+                                    if ui.button("俊敏→延長").clicked() {
+                                        brewing_preset(
+                                            &mut editor.inventory_draft,
+                                            "minecraft:swiftness",
+                                            "minecraft:redstone",
+                                        );
+                                    }
+                                });
                             }
+                            egui::ScrollArea::vertical()
+                                .max_height(220.0)
+                                .show(ui, |ui| {
+                                    for item in &mut editor.inventory_draft {
+                                        ui.horizontal(|ui| {
+                                            ui.label(format!("{}", item.slot));
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut item.id)
+                                                    .desired_width(145.0),
+                                            );
+                                            ui.add(
+                                                egui::DragValue::new(&mut item.count).range(0..=64),
+                                            );
+                                        });
+                                        if let Some(potion) = item.potion() {
+                                            ui.small(format!("  potion: {potion}"));
+                                        }
+                                    }
+                                });
+                            if ui.button("Inventoryを適用").clicked() {
+                                let items: Vec<_> = editor
+                                    .inventory_draft
+                                    .iter()
+                                    .filter(|item| !item.id.trim().is_empty() && item.count > 0)
+                                    .cloned()
+                                    .collect();
+                                match editor.document.set_inventory(pos, items) {
+                                    Ok(true) => {
+                                        editor.message = "Inventoryを更新しました".to_owned();
+                                        editor.simulation = None;
+                                        editor.brewing.clear();
+                                        editor.brewing_log.clear();
+                                        editor.running = false;
+                                        editor.inventory_for = None;
+                                    }
+                                    Ok(false) => {
+                                        editor.message = "Inventoryは変更なしです".to_owned()
+                                    }
+                                    Err(error) => editor.message = error,
+                                }
+                            }
+                        });
+                    }
+                    if let Some(stand) = editor.brewing.get(&pos) {
+                        ui.separator();
+                        ui.strong("Brewing (RedForge extension)");
+                        ui.add(
+                            egui::ProgressBar::new(stand.progress())
+                                .text(format!("残り {} / 400 tick", stand.brew_time)),
+                        );
+                        ui.label(format!(
+                            "燃料 {} / 比較器 {} / 瓶 {:?}",
+                            stand.fuel,
+                            stand.comparator_output(),
+                            stand.bottle_flags()
+                        ));
+                        let contents: Vec<_> = stand
+                            .items()
+                            .iter()
+                            .filter(|item| item.slot < 3)
+                            .map(|item| item.potion().unwrap_or(&item.id))
+                            .collect();
+                        ui.small(format!("内容: {}", contents.join(", ")));
+                        if stand.observer_pulse {
+                            ui.colored_label(egui::Color32::YELLOW, "Observer pulse");
+                        }
+                        ui.small("比較器値は正確に計算。Nucleation下流への動的伝播は未対応です。");
+                    }
+                } else {
+                    ui.label("セルを選択してください");
+                }
+                ui.separator();
+                ui.label("配置state");
+                ui.monospace(&editor.paint_state);
+                ui.separator();
+                ui.heading("Simulation");
+                egui::ComboBox::from_id_salt("settle")
+                    .selected_text(format!("{:?}", editor.settle_mode))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut editor.settle_mode,
+                            SettleMode::InWorld,
+                            "InWorld",
+                        );
+                        ui.selectable_value(
+                            &mut editor.settle_mode,
+                            SettleMode::Placement,
+                            "Placement",
+                        );
+                        ui.selectable_value(&mut editor.settle_mode, SettleMode::Quiet, "Quiet");
+                    });
+                ui.horizontal(|ui| {
+                    if ui.button("Start").clicked() {
+                        start_simulation(&mut editor);
+                    }
+                    if ui.button("Use").clicked() {
+                        use_selected(&mut editor);
+                    }
+                    if ui.button("Step").clicked() {
+                        step_simulation(&mut editor, 1);
+                    }
+                    if ui
+                        .button(if editor.running { "Pause" } else { "Run" })
+                        .clicked()
+                    {
+                        toggle_simulation(&mut editor);
+                    }
+                    if ui.button("Reset").clicked() {
+                        reset_simulation(&mut editor);
+                    }
+                });
+                ui.add(
+                    egui::Slider::new(&mut editor.ticks_per_second, 1.0..=100.0).text("ticks/sec"),
+                );
+                if let Some(simulation) = editor.simulation.as_ref() {
+                    ui.label(format!(
+                        "tick {} / {} changes / {}",
+                        simulation.tick(),
+                        simulation.change_count(),
+                        if simulation.is_quiescent() {
+                            "quiet"
+                        } else {
+                            "scheduled"
+                        }
+                    ));
+                    if let Ok(changes) = simulation.changes() {
+                        ui.collapsing("Block changes", |ui| {
+                            for change in changes.iter().rev().take(12).rev() {
+                                ui.small(format!(
+                                    "t{} ({},{},{}) {} → {}",
+                                    change.tick,
+                                    change.pos[0],
+                                    change.pos[1],
+                                    change.pos[2],
+                                    short_state(&change.from),
+                                    short_state(&change.to)
+                                ));
+                            }
+                        });
+                    }
+                }
+                if !editor.probe_history.is_empty() {
+                    ui.collapsing("Selected probe", |ui| {
+                        for (tick, state) in editor.probe_history.iter().rev().take(8).rev() {
+                            ui.small(format!("t{tick}: {}", short_state(state)));
                         }
                     });
                 }
-                if let Some(stand) = editor.brewing.get(&pos) {
-                    ui.separator();
-                    ui.strong("Brewing (RedForge extension)");
-                    ui.add(
-                        egui::ProgressBar::new(stand.progress())
-                            .text(format!("残り {} / 400 tick", stand.brew_time)),
-                    );
-                    ui.label(format!(
-                        "燃料 {} / 比較器 {} / 瓶 {:?}",
-                        stand.fuel,
-                        stand.comparator_output(),
-                        stand.bottle_flags()
-                    ));
-                    let contents: Vec<_> = stand
-                        .items()
-                        .iter()
-                        .filter(|item| item.slot < 3)
-                        .map(|item| item.potion().unwrap_or(&item.id))
-                        .collect();
-                    ui.small(format!("内容: {}", contents.join(", ")));
-                    if stand.observer_pulse {
-                        ui.colored_label(egui::Color32::YELLOW, "Observer pulse");
-                    }
-                    ui.small("比較器値は正確に計算。Nucleation下流への動的伝播は未対応です。");
+                if !editor.brewing_log.is_empty() {
+                    ui.collapsing("Brewing events", |ui| {
+                        for event in editor.brewing_log.iter().rev().take(8).rev() {
+                            ui.small(event);
+                        }
+                    });
                 }
-            } else {
-                ui.label("セルを選択してください");
-            }
-            ui.separator();
-            ui.label("配置state");
-            ui.monospace(&editor.paint_state);
-            ui.separator();
-            ui.heading("Simulation");
-            egui::ComboBox::from_id_salt("settle")
-                .selected_text(format!("{:?}", editor.settle_mode))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut editor.settle_mode, SettleMode::InWorld, "InWorld");
-                    ui.selectable_value(
-                        &mut editor.settle_mode,
-                        SettleMode::Placement,
-                        "Placement",
-                    );
-                    ui.selectable_value(&mut editor.settle_mode, SettleMode::Quiet, "Quiet");
-                });
-            ui.horizontal(|ui| {
-                if ui.button("Start").clicked() {
-                    start_simulation(&mut editor);
-                }
-                if ui.button("Use").clicked()
-                    && let (Some(pos), Some(simulation)) =
-                        (editor.selected, editor.simulation.as_mut())
-                {
-                    simulation.use_block(pos);
-                    editor.scene_epoch = editor.scene_epoch.wrapping_add(1);
-                    record_probe(&mut editor);
-                }
-                if ui.button("Step").clicked() {
-                    step_simulation(&mut editor, 1);
-                }
-                if ui
-                    .button(if editor.running { "Pause" } else { "Run" })
-                    .clicked()
-                    && editor.simulation.is_some()
-                {
-                    editor.running = !editor.running;
-                }
-                if ui.button("Reset").clicked() {
-                    editor.simulation = None;
-                    editor.brewing.clear();
-                    editor.brewing_log.clear();
-                    editor.running = false;
-                    editor.probe_history.clear();
-                    editor.scene_epoch = editor.scene_epoch.wrapping_add(1);
-                }
-            });
-            ui.add(egui::Slider::new(&mut editor.ticks_per_second, 1.0..=100.0).text("ticks/sec"));
-            if let Some(simulation) = editor.simulation.as_ref() {
-                ui.label(format!(
-                    "tick {} / {} changes / {}",
-                    simulation.tick(),
-                    simulation.change_count(),
-                    if simulation.is_quiescent() {
-                        "quiet"
-                    } else {
-                        "scheduled"
-                    }
-                ));
-                if let Ok(changes) = simulation.changes() {
-                    ui.collapsing("Block changes", |ui| {
-                        for change in changes.iter().rev().take(12).rev() {
+                let diagnostics = crate::simulation::diagnostics(&editor.document);
+                if !diagnostics.is_empty() {
+                    ui.collapsing(format!("Diagnostics ({})", diagnostics.len()), |ui| {
+                        for diagnostic in diagnostics.iter().take(8) {
                             ui.small(format!(
-                                "t{} ({},{},{}) {} → {}",
-                                change.tick,
-                                change.pos[0],
-                                change.pos[1],
-                                change.pos[2],
-                                short_state(&change.from),
-                                short_state(&change.to)
+                                "{:?} ({},{},{}): {}",
+                                diagnostic.level,
+                                diagnostic.pos.x,
+                                diagnostic.pos.y,
+                                diagnostic.pos.z,
+                                diagnostic.message
                             ));
                         }
                     });
                 }
-            }
-            if !editor.probe_history.is_empty() {
-                ui.collapsing("Selected probe", |ui| {
-                    for (tick, state) in editor.probe_history.iter().rev().take(8).rev() {
-                        ui.small(format!("t{tick}: {}", short_state(state)));
-                    }
-                });
-            }
-            if !editor.brewing_log.is_empty() {
-                ui.collapsing("Brewing events", |ui| {
-                    for event in editor.brewing_log.iter().rev().take(8).rev() {
-                        ui.small(event);
-                    }
-                });
-            }
-            let diagnostics = crate::simulation::diagnostics(&editor.document);
-            if !diagnostics.is_empty() {
-                ui.collapsing(format!("Diagnostics ({})", diagnostics.len()), |ui| {
-                    for diagnostic in diagnostics.iter().take(8) {
-                        ui.small(format!(
-                            "{:?} ({},{},{}): {}",
-                            diagnostic.level,
-                            diagnostic.pos.x,
-                            diagnostic.pos.y,
-                            diagnostic.pos.z,
-                            diagnostic.message
-                        ));
-                    }
-                });
-            }
+            });
         });
     egui::Panel::bottom("status").show(&mut root, |ui| {
         ui.label(&editor.message);
@@ -1319,17 +1600,19 @@ fn editor_ui(
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label("未保存の変更があります。破棄する操作を選んでください。");
+                ui.label("未保存の変更があります。");
                 ui.horizontal(|ui| {
-                    if ui.button("破棄してNew").clicked() {
-                        editor.replace_document(Document::default());
-                    }
-                    if ui.button("破棄してOpen").clicked() {
+                    if ui.button("破棄して続行").clicked() {
+                        let action = editor.pending_file_action.take();
                         editor.document.dirty = false;
-                        open_document(&mut editor);
+                        editor.confirm_discard = false;
+                        if let Some(action) = action {
+                            execute_file_action(&mut editor, action);
+                        }
                     }
                     if ui.button("Cancel").clicked() {
                         editor.confirm_discard = false;
+                        editor.pending_file_action = None;
                     }
                 });
             });
@@ -1402,30 +1685,83 @@ fn brew_event_label(event: BrewEvent) -> &'static str {
 }
 
 fn configure_fonts(ctx: &egui::Context) {
-    let candidates = [
-        Path::new(r"C:\Windows\Fonts\NotoSansJP-VF.ttf"),
-        Path::new(r"C:\Windows\Fonts\meiryo.ttc"),
-    ];
-    let Some(bytes) = candidates.iter().find_map(|path| std::fs::read(path).ok()) else {
-        return;
-    };
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
-        "redforge-japanese".to_owned(),
-        Arc::new(egui::FontData::from_owned(bytes)),
+        "udev-gothic".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/UDEVGothic-Regular.ttf"
+        ))),
     );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, "redforge-japanese".to_owned());
-    }
+    fonts.font_data.insert(
+        "jetbrains-mono".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/JetBrainsMono-Regular.ttf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "udev-gothic".to_owned());
+    let monospace = fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default();
+    monospace.insert(0, "udev-gothic".to_owned());
+    monospace.insert(0, "jetbrains-mono".to_owned());
     ctx.set_fonts(fonts);
+
+    ctx.set_theme(egui::Theme::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.indent = 16.0;
+    style.spacing.slider_width = 128.0;
+    style.text_styles.insert(
+        egui::TextStyle::Heading,
+        egui::FontId::new(19.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::new(14.0, egui::FontFamily::Proportional),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Monospace,
+        egui::FontId::new(13.0, egui::FontFamily::Monospace),
+    );
+    style.visuals.panel_fill = egui::Color32::from_rgb(24, 27, 34);
+    style.visuals.window_fill = egui::Color32::from_rgb(28, 32, 40);
+    ctx.set_style_of(egui::Theme::Dark, style);
+}
+
+fn request_file_action(editor: &mut Editor, action: FileAction) {
+    if editor.document.dirty {
+        editor.pending_file_action = Some(action);
+        editor.confirm_discard = true;
+    } else {
+        execute_file_action(editor, action);
+    }
+}
+
+fn execute_file_action(editor: &mut Editor, action: FileAction) {
+    match action {
+        FileAction::New => {
+            editor.replace_document(Document::default());
+            editor.active_layer = 1;
+            editor.message = "新規プロジェクト".to_owned();
+        }
+        FileAction::Open => open_document(editor),
+    }
 }
 
 fn open_document(editor: &mut Editor) {
-    let path = normalized_path(&editor.file_path);
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("Litematic", &["litematic"])
+        .pick_file()
+    else {
+        editor.message = "Openをキャンセルしました".to_owned();
+        return;
+    };
     match Document::open(&path) {
         Ok(document) => {
             editor.replace_document(document);
@@ -1436,22 +1772,40 @@ fn open_document(editor: &mut Editor) {
 }
 
 fn save_document(editor: &mut Editor) {
-    let path = normalized_path(&editor.file_path);
-    match editor.document.save(&path) {
-        Ok(()) => {
-            editor.file_path = path.display().to_string();
-            editor.message = format!("{} を保存しました", path.display());
-        }
-        Err(error) => editor.message = error,
-    }
+    let Some(path) = editor.document.path().map(|path| path.to_path_buf()) else {
+        save_document_as(editor);
+        return;
+    };
+    save_document_to(editor, path);
 }
 
-fn normalized_path(text: &str) -> PathBuf {
-    let path = Path::new(text.trim());
-    if path.extension().is_none() {
-        path.with_extension("litematic")
+fn save_document_as(editor: &mut Editor) {
+    let suggested_name = editor
+        .document
+        .path()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("design.litematic");
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("Litematic", &["litematic"])
+        .set_file_name(suggested_name)
+        .save_file()
+    else {
+        editor.message = "Saveをキャンセルしました".to_owned();
+        return;
+    };
+    let path = if path.extension().is_some() {
+        path
     } else {
-        path.to_owned()
+        path.with_extension("litematic")
+    };
+    save_document_to(editor, path);
+}
+
+fn save_document_to(editor: &mut Editor, path: PathBuf) {
+    match editor.document.save(&path) {
+        Ok(()) => editor.message = format!("{} を保存しました", path.display()),
+        Err(error) => editor.message = error,
     }
 }
 
@@ -1489,6 +1843,19 @@ fn short_state(state: &str) -> String {
     }
 }
 
+fn short_palette_label(label: &str) -> String {
+    let initials: String = label
+        .split_whitespace()
+        .filter_map(|part| part.chars().next())
+        .take(2)
+        .collect();
+    if initials.chars().count() > 1 {
+        initials
+    } else {
+        label.chars().take(2).collect()
+    }
+}
+
 fn block_shape(state: &str) -> (Vec3, Vec3) {
     if state.contains("redstone_wire") || state.contains("pressure_plate") {
         (Vec3::new(0.82, 0.06, 0.82), Vec3::new(0.0, -0.43, 0.0))
@@ -1503,7 +1870,7 @@ fn block_shape(state: &str) -> (Vec3, Vec3) {
     } else if state.contains("hopper") {
         (Vec3::new(0.78, 0.68, 0.78), Vec3::new(0.0, -0.12, 0.0))
     } else {
-        (Vec3::splat(0.92), Vec3::ZERO)
+        (Vec3::ONE, Vec3::ZERO)
     }
 }
 
